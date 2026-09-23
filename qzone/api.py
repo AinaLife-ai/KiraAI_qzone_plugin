@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import time
 import logging
 from typing import Any
@@ -156,10 +157,13 @@ class QzoneAPI(QzoneHttpClient):
             "qzreferrer": f"{self.BASE_URL}/{ctx.uin}",
         }
         download_errors: list[str] = []
+        uploaded_pairs: list[tuple[str, bytes]] = []
         if post.images:
             logger.debug(f"正在上传图片: {post.images}")
             pic_bos, richvals = [], []
-            imgs: list[bytes] = await normalize_images(post.images, errors=download_errors)
+            imgs: list[bytes] = await normalize_images(
+                post.images, errors=download_errors, pairs=uploaded_pairs
+            )
             if not imgs:
                 if allow_image_drop:
                     logger.warning(
@@ -176,7 +180,10 @@ class QzoneAPI(QzoneHttpClient):
                 resp = await self._upload_image(img)
                 if not resp.ok:
                     raise RuntimeError(f"上传图片失败: {resp.message}")
-                picbo, richval = QzoneParser.parse_upload_result(resp.data)
+                try:
+                    picbo, richval = QzoneParser.parse_upload_result(resp.data)
+                except ValueError as e:
+                    raise RuntimeError(f"上传图片结果解析失败: {e}")
                 pic_bos.append(picbo)
                 richvals.append(richval)
             if pic_bos:
@@ -196,6 +203,13 @@ class QzoneAPI(QzoneHttpClient):
         # 部分图片失败时把原因捎带给调用方（不影响发布结果）
         if resp.ok and download_errors:
             resp.message = "; ".join(download_errors)
+        # 把"实际发布成功"的图片内容指纹回传：发布链路也能拿到 md5，
+        # 不再依赖插件是否提前识图；去重历史据此按**内容**判定，而不是靠易变的 URL。
+        if resp.ok and uploaded_pairs:
+            resp.data = dict(resp.data or {})
+            resp.data["image_md5s"] = [
+                (source, hashlib.md5(data).hexdigest()) for source, data in uploaded_pairs
+            ]
         return resp
 
     async def like(
@@ -256,14 +270,6 @@ class QzoneAPI(QzoneHttpClient):
                 ok=False, code=-1, message=str(e),
                 data={}, raw={},
             )
-        return ApiResponse(
-            ok=False,
-            code=-1,
-            message="; ".join(errors) or "点赞失败",
-            data={},
-            raw={},
-        )
-
     async def unlike(
         self,
         post: Post,
@@ -812,7 +818,7 @@ class QzoneAPI(QzoneHttpClient):
             )
             if raw1.get("code") == 0 or raw1.get("msglist") or raw1.get("data"):
                 logger.info(f"QZone详情成功: route=h5 post={post.tid}")
-                return ApiResponse.from_raw(raw1)
+                return ApiResponse.from_raw(raw1, success_if_data=True)
             errors.append(f"h5: code={raw1.get('code')} msg={raw1.get('msg') or raw1.get('message')}")
         except Exception as e:
             errors.append(f"h5: {e}")
@@ -839,7 +845,7 @@ class QzoneAPI(QzoneHttpClient):
             )
             if raw2.get("code") == 0 or raw2.get("ret") == 0 or raw2.get("msglist") or raw2.get("data"):
                 logger.info(f"QZone详情成功: route=pc post={post.tid}")
-                return ApiResponse.from_raw(raw2)
+                return ApiResponse.from_raw(raw2, success_if_data=True)
             errors.append(f"pc: code={raw2.get('code')} msg={raw2.get('msg') or raw2.get('message')}")
         except Exception as e:
             errors.append(f"pc: {e}")
@@ -865,7 +871,7 @@ class QzoneAPI(QzoneHttpClient):
             )
             if raw3.get("code") == 0 or raw3.get("data"):
                 logger.info(f"QZone详情成功: route=mobile post={post.tid}")
-                return ApiResponse.from_raw(raw3)
+                return ApiResponse.from_raw(raw3, success_if_data=True)
             errors.append(f"mobile: code={raw3.get('code')} msg={raw3.get('msg') or raw3.get('message')}")
         except Exception as e:
             errors.append(f"mobile: {e}")
