@@ -187,7 +187,11 @@ class QzonePlugin(BasePlugin):
         self.max_replies_per_cycle = cfg.get("max_replies_per_cycle", 5)
 
         # Cookie 周期刷新间隔（秒），0/None 表示不周期刷
-        self.cookie_refresh_interval = self._parse_interval_seconds(cfg.get("cookie_refresh_interval", "2h"))
+        # 注意 default_unit="s"：文档写明"支持 2h、30m、7200（秒）"，
+        # 因此裸数字按秒解释（旧实现按分钟，用户填 7200 实际成了 5 天）。
+        self.cookie_refresh_interval = self._parse_interval_seconds(
+            cfg.get("cookie_refresh_interval", "2h"), default_unit="s"
+        )
         # 用即刷节流：调用空间功能时，若距上次刷新超过该间隔则顺手刷新（秒），0/None 关闭
         self.cookie_refresh_on_use = self._parse_interval_seconds(cfg.get("cookie_refresh_on_use", "10m"))
 
@@ -2330,7 +2334,8 @@ class QzonePlugin(BasePlugin):
     # ---------- 图片去重（内容指纹优先，来源串兜底） ----------
     @staticmethod
     def _identity_key(source: str) -> str:
-        src = str(source or "")
+        # 先 strip：AI 传回的 images 参数常带空格/引号，不归一会导致去重身份对不上
+        src = str(source or "").strip()
         if src.startswith(("http://", "https://")):
             return clean_url(src)
         return src
@@ -2702,11 +2707,15 @@ class QzonePlugin(BasePlugin):
 
     @staticmethod
     def _format_manifest_time(value) -> str:
-        """清单时间格式化：单个脏值不能让整份清单消失（钩子里尤其要稳）。"""
+        """清单时间格式化：单个脏值不能让整份清单消失（钩子里尤其要稳）。
+
+        脏值/缺失如实显示"时间未知"，不要伪装成"现在"——否则 AI 会把很老的历史图
+        当成刚出现的图。
+        """
         try:
             ts = _to_float(value, 0.0)
             if ts <= 0:
-                ts = time.time()
+                return "时间未知"
             return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
         except Exception:
             return "时间未知"
