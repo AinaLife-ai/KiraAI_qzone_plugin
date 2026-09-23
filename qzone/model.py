@@ -7,6 +7,23 @@ from typing import Any, Optional, List
 import pydantic
 from pydantic import BaseModel
 
+from .constants import QZONE_INTERNAL_META_KEY
+
+
+def _to_int(value, default: int = 0) -> int:
+    """接口字段安全转 int（None/""/"abc"/"1.0" 都不抛异常）。"""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return default
+
 
 def extract_and_replace_nickname(input_string):
     """提取并替换昵称（处理QQ空间消息中的格式）"""
@@ -93,9 +110,18 @@ class ApiResponse:
         msg_key: str | tuple[str, ...] = ("message", "msg"),
         data_key: str | None = None,
         success_code: int = 0,
+        success_if_data: bool = False,
     ) -> "ApiResponse":
         # 解析 code
         code = raw.get(code_key, -1)
+        # 兼容字符串形式的 code
+        if isinstance(code, str) and code.strip().lstrip("-").isdigit():
+            code = int(code.strip())
+        # 部分接口（如 h5 详情）成功时不带 code 字段，但一定带数据体；
+        # 由调用方显式声明"有数据即成功"，避免路由层判成功、这里却判失败。
+        if code != success_code and success_if_data:
+            if raw.get("data") or raw.get("msglist"):
+                code = success_code
 
         # 解析 message
         message = None
@@ -112,7 +138,7 @@ class ApiResponse:
             if data_key is None:
                 data = dict(raw)
                 # 移除内部元数据
-                data.pop("__qzone_internal__", None)
+                data.pop(QZONE_INTERNAL_META_KEY, None)
             else:
                 data = raw.get(data_key, {})
             return cls(
@@ -196,10 +222,10 @@ class Comment(BaseModel):
         except (TypeError, ValueError):
             tid_int = 0
         return Comment(
-            uin=int(raw.get("uin") or 0),
+            uin=_to_int(raw.get("uin"), 0),
             nickname=raw.get("name") or "",
             content=raw.get("content") or "",
-            create_time=int(raw.get("create_time") or 0),
+            create_time=_to_int(raw.get("create_time"), 0),
             create_time_str=raw.get("createTime2") or "",
             tid=tid_int,
             comment_id=comment_id.strip(),
@@ -213,7 +239,9 @@ class Comment(BaseModel):
         """将 commentlist 整段 flatten 成 List[Comment]"""
         res: List["Comment"] = []
         for main in comment_list:
-            main_tid = int(main.get("tid") or 0)
+            # 评论 tid 可能是非纯数字（QZone 会用 "xxx_r_yyy" 这类合成 id）。
+            # 直接 int() 会抛异常，进而把整页说说吞成空列表。
+            main_tid = _to_int(main.get("tid"), 0)
             res.append(Comment.from_raw(main, parent_tid=None))
             for sub in main.get("list_3") or []:
                 res.append(Comment.from_raw(sub, parent_tid=main_tid))
