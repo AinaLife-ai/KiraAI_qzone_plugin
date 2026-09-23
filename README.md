@@ -140,7 +140,7 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 | `visitor_limit` | int | 否 | 访客统计最多返回的最近访客明细条数，默认 20，可设置 1-50；今日和最近30天统计数字不受影响。 |
 | `image_manifest_enabled` | switch | 否 | 是否向 AI 注入「近期图片清单」（含每张图的内容描述），默认开启。开启后她发说说配图时知道图片实际内容，可按序号选图。 |
 | `image_manifest_count` | int | 否 | 近期图片清单包含的图片数量（每会话），默认 5。实时消息中的图片和定时任务读取到的历史消息图片都会进入清单。 |
-| `manifest_hook_budget_ms` | int | 否 | 注入清单时的整体时间预算（毫秒），默认 `150`，仅作兜底：清单读取只查缓存、绝不下载。 |
+| `manifest_hook_budget_ms` | int | 否 | 注入清单时的整体时间预算（毫秒），默认 `150`，仅作兜底：清单读取只查缓存、绝不下载（实测内存命中约 1ms；数据库极慢时也不会超过该预算 +20ms）。填 `0` = 连缓存查询也不做（最保守档）。 |
 | `image_desc_concurrency` | int | 否 | 后台识图并发上限，默认 `2`，避免和其它识图插件抢带宽把 CDN 拖到超时。 |
 | `image_desc_timeout` | int | 否 | 单张图识图总预算（秒），默认 `45`（含续命、下载与 VLM 调用）。 |
 | `image_fetch_fail_ttl` | string | 否 | 图片失效/识图失败后的静默时长，默认 `10m`：这段时间不再重复下载、不再刷日志，到期自动再试。 |

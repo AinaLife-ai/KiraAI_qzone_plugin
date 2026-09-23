@@ -117,6 +117,26 @@ class TestManifestRobustness(B.LoopTestCase):
             B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
         self.assertIn("库里的描述", req.user_prompt[0].text)
 
+    def test_budget_zero_skips_db_lookup(self):
+        """预算 0 的语义是"完全不查缓存"（最保守档），不是"不限制"。"""
+        plugin, ctx = B.make_plugin(cfg={'manifest_hook_budget_ms': 0})
+        calls = []
+
+        async def counting_db(md5):
+            calls.append(md5)
+            return {"md5": md5, "description": "库里的描述", "count": 1, "last_seen": 0}
+
+        ctx.db.get_image_desc_cache = counting_db
+        entry = {"source": "url", "url": "https://x/1.jpg", "sender": "A",
+                 "time": int(time.time()), "desc": None, "msg_id": None}
+        plugin._image_registry[SID] = [entry]
+        plugin._entry_md5[plugin._entry_key(entry)] = "deadbeef"
+        req = B.LLMRequest()
+        self.run_(plugin._inject_image_manifest(
+            B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
+        self.assertEqual(calls, [], "预算 0 时不应做任何缓存查询")
+        self.assertIn("暂未识别", req.user_prompt[0].text)
+
     def test_budget_zero_still_returns(self):
         """预算为 0（不限制）时也必须正常返回，不抛异常。"""
         plugin, ctx = B.make_plugin(cfg={'manifest_hook_budget_ms': 0})

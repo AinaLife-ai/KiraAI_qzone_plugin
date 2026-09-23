@@ -201,7 +201,9 @@ class QzonePlugin(BasePlugin):
         ) or 600
         self.image_desc_timeout = max(5, int(cfg.get("image_desc_timeout", 45) or 45))
         self.image_download_timeout = max(5, int(cfg.get("image_download_timeout", 20) or 20))
-        # 清单钩子整体时间预算（毫秒）；0 表示不限制（不推荐）
+        # 清单钩子整体时间预算（毫秒），用于兜底：
+        # >0 → 允许在预算内做缓存查询；0 → 连缓存查询也不做（最保守档，
+        # 只读内存 + 触发后台任务，钩子成本恒为微秒级）。
         self.manifest_hook_budget_ms = max(0, int(cfg.get("manifest_hook_budget_ms", 150) or 0))
         # OneBot 动作默认超时（秒）
         self.onebot_action_timeout = self._parse_interval_seconds(
