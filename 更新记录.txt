@@ -171,5 +171,12 @@ v1.4.7：
   - 依赖清理：移除未使用的 `aiofiles`。
   - 新增 `tests/` 离线自检（89 项断言，桩件替代网络）；反向验证：把本版改动回退后跑同一套自检会有 62 项报红，说明判据不是"永远成立"。
   - 新增配置项：`cookie_self_heal`、`cookie_self_heal_threshold`、`cookie_self_heal_probe`、`cookie_self_heal_reload`、`cookie_self_heal_reload_cooldown`、`cookie_self_heal_restart_adapter`、`onebot_action_timeout`、`image_download_timeout`、`manifest_hook_budget_ms`、`image_desc_concurrency`、`image_desc_timeout`、`image_fetch_fail_ttl`。
+  - 自审补丁（v1.4.7 追加）：
+    - 连接自愈改为「每再失败同样次数重新触发一次」（原来触发条件是"恰好第 N 次失败"，失败一次之后就再也不会重试，插件会一直卡在不可用状态）；
+    - 软重置不再当场关闭 HTTP 会话（可能还有在途的发布/评论请求，会被打断），改为摘下来交给后台延迟关闭，并在插件卸载时兜底关闭；
+    - 自动重载若未真正生效（如插件目录缺失），不再把后续重试永久锁死；
+    - 图片清单的时间格式化增加容错（单条脏值不再让整份清单消失）；清单的缓存查询预算改为按剩余时间取，避免"描述已在库里"这一轮用不上；
+    - 图片下载对任意 4xx 都不重试；最近说说结构为 null 时不再抛异常；
+    - 新增 tests/test_review_fixes.py 把以上行为锁住（全量自检 104 项）。
   - 说明：`auto_publish_image_fallback` 为保留配置项（当前版本未接线），配图不足时的降级行为由既有"按目标数量尽量补足、不足则少图或纯文字"统一处理。
 
