@@ -25,6 +25,7 @@ MODULES = [
     'test_image_dedupe',
     'test_tool_flows',
     'test_lifecycle',
+    'test_review_fixes',
 ]
 
 

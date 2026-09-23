@@ -247,6 +247,8 @@ class QzonePlugin(BasePlugin):
         self._entry_desc: dict[str, str] = {}
         # 近期图片短缓存：sid -> (时间戳, [url])
         self._recent_images_cache: dict[str, tuple[float, list]] = {}
+        # 软重置时摘下来的旧 HTTP 会话（延迟关闭；卸载时兜底关闭）
+        self._detached_apis: list = []
         # OneBot 失败状态机
         self._onebot_fail_streak = 0
         self._onebot_state = "ok"
@@ -697,19 +699,36 @@ class QzonePlugin(BasePlugin):
         只清插件自己缓存的、会失效的外部状态；不动用户的配置与业务数据。
         """
         self._ada_obj = None                      # 1. 丢弃适配器引用（下次重新解析）
-        try:
-            if self.api is not None:
-                await self.api.close()
-        except Exception as e:
-            logger.debug(f"关闭旧会话时出错: {e}")
-        self.api = None
+        # 2. 摘掉旧会话。注意：**不要当场 close** —— 此刻可能还有在途请求
+        #   （例如正在发布/评论的 HTTP 调用），当场关掉会把它们打断。
+        #   改为交给后台延迟关闭，插件卸载时也会兜底关。
+        old_api, self.api = self.api, None
         self.session = None
+        if old_api is not None:
+            self._detached_apis.append(old_api)
+            self._spawn_task(self._close_api_later(old_api))
         self._init_failed = False                 # 2. 清失败标记
         self._last_cookie_refresh = 0.0           # 3. 解除节流，允许立刻重试
         self._recent_images_cache.clear()         # 4. 清与会话绑定的短缓存
         self._cancel_startup_retry()              # 5. 重排启动退避重试
         self._startup_retry_task = self._spawn_task(self._retry_startup_cookie())
         logger.info(f"已执行连接软重置（{reason or '手动'}），正在后台重新获取凭证")
+
+    async def _close_api_later(self, api, delay: float = None):
+        """延迟关闭被摘掉的旧会话：给在途请求留出跑完的时间，避免打断它们。"""
+        try:
+            await asyncio.sleep(self.timeout * 2 if delay is None else delay)
+        except asyncio.CancelledError:
+            # 被取消（例如插件卸载）：这里**不能**把 api 从登记表摘掉，
+            # 否则 terminate 的兜底循环就找不到它、会话永远不会被关闭。
+            raise
+        try:
+            await api.close()
+        except Exception as e:
+            logger.debug(f"关闭旧会话失败: {e}")
+        finally:
+            if api in self._detached_apis:
+                self._detached_apis.remove(api)
 
     def _cancel_startup_retry(self):
         task = self._startup_retry_task
@@ -760,6 +779,9 @@ class QzonePlugin(BasePlugin):
                 await mgr.reload("qzone_plugin")
             except Exception as e:
                 logger.error(f"插件自动重载失败: {e}")
+            finally:
+                # 无论成败都解锁：成功的重载会终结本实例；万一 reload 没真正生效
+                # （例如插件目录缺失），也不至于把后续重试永久锁死。
                 self._reload_inflight = False
 
         self._spawn_task(_run(), track=False)   # 独立 task，不登记（否则会被自身 terminate 取消）
@@ -1007,6 +1029,12 @@ class QzonePlugin(BasePlugin):
             if self.auto_refresh and self.cookie_self_heal:
                 self._trigger_self_heal(f"连续 {streak} 次 OneBot 调用失败")
         elif streak > threshold:
+            # 已经失败过阈值：每再失败 threshold 次重新触发一次自愈。
+            # 否则自愈只在"恰好第 threshold 次"尝试一次，失败后就再也不会重试，
+            # 插件会一直卡在不可用状态直到某次偶然成功。
+            if self.auto_refresh and self.cookie_self_heal and streak % threshold == 0:
+                logger.info(f"OneBot 仍未恢复（连续 {streak} 次），再次触发连接自愈")
+                self._trigger_self_heal(f"连续 {streak} 次 OneBot 调用失败")
             logger.debug(f"OneBot 仍不可用（连续 {streak} 次）：{reason}")
         else:
             self._onebot_state = "degraded"
@@ -1128,6 +1156,14 @@ class QzonePlugin(BasePlugin):
             self._bg_tasks.clear()
             self._desc_tasks.clear()
             self._state_flush_task = None
+
+            # 软重置时摘下来的旧会话：延迟关闭任务可能已被取消，这里兜底关掉
+            for stale_api in list(self._detached_apis):
+                try:
+                    await stale_api.close()
+                except Exception:
+                    pass
+            self._detached_apis.clear()
 
             if self.api:
                 await self.api.close()
@@ -2127,11 +2163,13 @@ class QzonePlugin(BasePlugin):
             for i, entry in enumerate(entries, 1):
                 desc = self._read_entry_desc(entry)          # 同步、零 IO
                 if not desc and deadline is not None and time.monotonic() < deadline:
-                    desc = await self._cached_desc_bounded(entry)   # 仅一次带预算的缓存查询
+                    # 预算内做**一次**缓存查询：取不到就交给后台任务（下一轮通常已就绪）
+                    budget = max(0.02, min(0.2, deadline - time.monotonic()))
+                    desc = await self._cached_desc_bounded(entry, budget)
                 if not desc:
                     self._schedule_describe(entry)           # 只触发，不等待
                 display_desc = candidate_label(desc)
-                time_str = datetime.fromtimestamp(entry["time"]).strftime("%m-%d %H:%M")
+                time_str = self._format_manifest_time(entry.get("time"))
                 sender = entry.get("sender") or "未知"
                 lines.append(f"{i}. [{time_str} {sender}] {display_desc}")
             if not lines:
@@ -2146,7 +2184,7 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.debug(f"注入图片清单失败: {e}")
 
-    async def _cached_desc_bounded(self, entry: dict) -> str:
+    async def _cached_desc_bounded(self, entry: dict, budget: float = 0.2) -> str:
         """仅做一次带预算的缓存查询：拿不到就放弃本轮（下一轮通常已就绪）。"""
         key = self._entry_key(entry)
         if not key:
@@ -2158,7 +2196,7 @@ class QzonePlugin(BasePlugin):
         if not md5:
             return ""
         try:
-            desc = await asyncio.wait_for(self._cache_get_desc(md5), timeout=0.05)
+            desc = await asyncio.wait_for(self._cache_get_desc(md5), timeout=budget)
         except Exception:
             return ""
         if desc:
@@ -2213,51 +2251,48 @@ class QzonePlugin(BasePlugin):
         """
         paths = []
         entries = self._manifest_entries(sid, apply_dedupe=apply_dedupe)
-        try:
-            normalized_indices = []
-            for idx in indices:
+        normalized_indices = []
+        for idx in indices:
+            try:
+                normalized_indices.append(int(idx))
+            except (TypeError, ValueError):
+                return []
+        if not normalized_indices:
+            return []
+        if any(not (1 <= i <= len(entries)) for i in normalized_indices):
+            return []
+        for i in dict.fromkeys(normalized_indices):
+            entry = entries[i - 1]
+            if apply_dedupe and self._is_recently_published_image(self._entry_source(entry)):
+                logger.info(f"清单图片 {i} 处于图片去重间隔内，已跳过（避免连续配同一张图）")
+                continue
+            if entry.get("source") == "url":
+                url = entry.get("url", "")
+                if url:
+                    # 历史 URL 的 rkey 有效期约 1 小时，过期后下载必 400；
+                    # 先用 get_msg 按 message_id 续命换新签名 URL，失败再退回原 URL。
+                    if entry.get("msg_id") and await self._refresh_image_url(entry):
+                        url = entry.get("url") or url
+                        logger.info(f"历史图片已续命成功: {url[:80]}")
+                    paths.append(url)
+                continue
+            elem: Image = entry["elem"]
+            for attempt in range(2):
                 try:
-                    normalized_indices.append(int(idx))
-                except (TypeError, ValueError):
-                    return []
-            if not normalized_indices:
-                return []
-            if any(not (1 <= i <= len(entries)) for i in normalized_indices):
-                return []
-            for i in dict.fromkeys(normalized_indices):
-                entry = entries[i - 1]
-                if apply_dedupe and self._is_recently_published_image(self._entry_source(entry)):
-                    logger.info(f"清单图片 {i} 处于图片去重间隔内，已跳过（避免连续配同一张图）")
-                    continue
-                if entry.get("source") == "url":
-                    url = entry.get("url", "")
-                    if url:
-                        # 历史 URL 的 rkey 有效期约 1 小时，过期后下载必 400；
-                        # 先用 get_msg 按 message_id 续命换新签名 URL，失败再退回原 URL。
-                        if entry.get("msg_id") and await self._refresh_image_url(entry):
-                            url = entry.get("url") or url
-                            logger.info(f"历史图片已续命成功: {url[:80]}")
-                        paths.append(url)
-                    continue
-                elem: Image = entry["elem"]
-                for attempt in range(2):
-                    try:
-                        path = await elem.to_path()
-                        if path:
-                            head = await asyncio.to_thread(_read_head_bytes, path, 16)
-                            if looks_like_image(head):
-                                paths.append(str(path))
-                                break
-                            logger.warning(f"清单图片 {i} 缓存内容不是图片: {path}")
-                        raise ValueError("to_path 为空或内容非图片")
-                    except Exception as e:
-                        if attempt == 0 and await self._refresh_image_url(entry):
-                            continue
-                        logger.warning(f"清单图片 {i} 获取失败: {e}")
-                        break
-            return paths
-        finally:
-            pass
+                    path = await elem.to_path()
+                    if path:
+                        head = await asyncio.to_thread(_read_head_bytes, path, 16)
+                        if looks_like_image(head):
+                            paths.append(str(path))
+                            break
+                        logger.warning(f"清单图片 {i} 缓存内容不是图片: {path}")
+                    raise ValueError("to_path 为空或内容非图片")
+                except Exception as e:
+                    if attempt == 0 and await self._refresh_image_url(entry):
+                        continue
+                    logger.warning(f"清单图片 {i} 获取失败: {e}")
+                    break
+        return paths
 
     def _find_image_registry_entry(self, sid: str, source: str) -> Optional[dict]:
         """按来源 URL 定位候选，优先当前会话，再检查其他会话的同源条目。"""
@@ -2662,6 +2697,17 @@ class QzonePlugin(BasePlugin):
         if len(self.my_posts_history) > MAX_HISTORY:
             self.my_posts_history.pop(0)
         self._save_state()
+
+    @staticmethod
+    def _format_manifest_time(value) -> str:
+        """清单时间格式化：单个脏值不能让整份清单消失（钩子里尤其要稳）。"""
+        try:
+            ts = _to_float(value, 0.0)
+            if ts <= 0:
+                ts = time.time()
+            return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        except Exception:
+            return "时间未知"
 
     @staticmethod
     def _format_time(ts) -> str:

@@ -143,14 +143,18 @@ def is_safe_public_url(url: str) -> bool:
 _shared_session: Optional[aiohttp.ClientSession] = None
 _shared_session_loop: Optional[object] = None
 _session_lock: Optional[asyncio.Lock] = None
+_session_lock_loop: Optional[object] = None
 
 
 async def _get_shared_session() -> aiohttp.ClientSession:
     """懒创建共享会话；事件循环变化（如插件热重载）时自动重建。"""
-    global _shared_session, _shared_session_loop, _session_lock
+    global _shared_session, _shared_session_loop, _session_lock, _session_lock_loop
     loop = asyncio.get_running_loop()
-    if _session_lock is None or _shared_session_loop is not loop:
+    # 锁跟随"事件循环"而非"会话"：会话被关掉后不会顺手换锁，
+    # 避免关闭瞬间的并发调用各拿一把锁、创建出两个会话。
+    if _session_lock is None or _session_lock_loop is not loop:
         _session_lock = asyncio.Lock()
+        _session_lock_loop = loop
     async with _session_lock:
         if _shared_session is None or _shared_session.closed or _shared_session_loop is not loop:
             _shared_session = aiohttp.ClientSession(
@@ -235,7 +239,7 @@ async def fetch_bytes(
                     return FetchResult(True, data=data, status=resp.status, reason="ok")
                 last_status = resp.status
                 last_reason = f"HTTP {resp.status}"
-                if resp.status in NO_RETRY_STATUSES:
+                if resp.status in NO_RETRY_STATUSES or 400 <= resp.status < 500:
                     # 链接过期/不存在：重试同一 URL 无意义（NapCat #190/#265），
                     # 快速失败交由上层 get_msg 续命或降级，避免 3 次 × 2s 白等。
                     _log_fetch_failure(url, resp.status, last_reason)
