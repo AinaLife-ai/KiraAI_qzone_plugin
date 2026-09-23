@@ -22,7 +22,42 @@
     "cookie_refresh_on_use": {
         "type": "string",
         "default": "10m",
-        "hint": "用即刷节流：调用空间功能时，距上次刷新超过该间隔就顺手刷新一次（如 '10m'、'30m'）。保持 Cookie 新鲜又不会每次调用都打扰 OneBot。填 0 则关闭（完全依赖周期刷新和失效自动救）。"
+        "hint": "用即刷节流：调用空间功能时，距上次刷新超过该间隔就顺手刷新一次（如 '10m'、'30m'）。保持 Cookie 新鲜又不会每次调用都打扰 OneBot。填 0 则关闭（完全依赖周期刷新和失效自动救）。注意：刷新在后台执行，不会拖慢工具调用。"
+    },
+    "cookie_self_heal": {
+        "type": "switch",
+        "default": true,
+        "hint": "连接自愈：从 OneBot 获取 Cookie 连续失败到阈值时，自动执行「软重置」（丢弃缓存的适配器引用、重建会话、解除刷新节流、重排退避重试），效果等同于手动重载一次插件。全程在后台进行，不打断正常回复。"
+    },
+    "cookie_self_heal_threshold": {
+        "type": "int",
+        "default": 3,
+        "hint": "连续失败多少次触发连接自愈（默认 3）。"
+    },
+    "cookie_self_heal_probe": {
+        "type": "string",
+        "default": "60s",
+        "hint": "软重置后的恢复观察窗口，如 '60s'、'2m'。窗口内恢复就结束自愈，超时才升级到自动重载插件。"
+    },
+    "cookie_self_heal_reload": {
+        "type": "switch",
+        "default": true,
+        "hint": "自愈观察窗口内仍未恢复时，自动执行一次「重载插件」（完全等同于在 WebUI 点一次重载）。两次自动重载之间有冷却，冷却时间会持久化，避免重载风暴；不中断 QQ 消息。"
+    },
+    "cookie_self_heal_reload_cooldown": {
+        "type": "string",
+        "default": "10m",
+        "hint": "两次「自动重载插件」之间的最小间隔，如 '10m'、'30m'。同时也是适配器重启的冷却时间。"
+    },
+    "cookie_self_heal_restart_adapter": {
+        "type": "switch",
+        "default": false,
+        "hint": "最后手段：关闭「自动重载插件」时，可用「重启 QQ 适配器」真正重建 WebSocket 连接。注意：重启期间该适配器上所有 QQ 消息会短暂中断数秒，所以默认关闭，只在确认其它手段无效时开启。"
+    },
+    "onebot_action_timeout": {
+        "type": "string",
+        "default": "5s",
+        "hint": "调用 OneBot 动作（如获取 Cookie、取消息）的超时时间，如 '5s'、'10s'。调小可以更快失败并转入后台重试。"
     },
     "master_ids": {
         "type": "string",
@@ -37,7 +72,12 @@
     "timeout": {
         "type": "int",
         "default": 10,
-        "hint": "HTTP请求超时时间（秒）"
+        "hint": "HTTP请求超时时间（秒），用于空间接口请求。"
+    },
+    "image_download_timeout": {
+        "type": "int",
+        "default": 20,
+        "hint": "图片下载的单次请求超时（秒）。只在网络抖动时重试，链接过期（HTTP 400/403/404）会立即失败并交由续命或降级，不会白等。"
     },
     "temp_dir": {
         "type": "string",
@@ -108,12 +148,12 @@
     "auto_publish_image_fallback": {
         "type": "switch",
         "default": false,
-        "hint": "AI返回非法图片选择时是否从候选图兜底；关闭时发布纯文字。"
+        "hint": "保留配置项（当前版本未接线）：配图选择异常时的兜底行为由「按目标数量尽量补足、候选不足则降级为少图或纯文字」统一处理。"
     },
     "auto_publish_image_dedupe_interval": {
         "type": "string",
         "default": "3d",
-        "hint": "主动发布图片去重间隔，如 3d、72h、12h、0。仅发布成功后记录。"
+        "hint": "主动发布图片去重间隔，如 3d、72h、12h、0。仅发布成功后记录。按图片**内容**判重（链接换签名也算同一张），定时发布与群聊指令模式均生效；用户主动指定图片不受限制。"
     },
     "max_comments_per_cycle": {
         "type": "int",
@@ -191,6 +231,11 @@
         "default": 5,
         "hint": "近期图片清单包含的图片数量（每会话）。"
     },
+    "manifest_hook_budget_ms": {
+        "type": "int",
+        "default": 150,
+        "hint": "注入图片清单时的整体时间预算（毫秒）。清单读取只查缓存、绝不下载，所以正常远低于该预算；预算只用于兜底，避免极端情况下拖慢本轮回复。"
+    },
     "qzone_image_desc_enabled": {
         "type": "switch",
         "default": true,
@@ -211,6 +256,21 @@
         "model_type": "llm",
         "default": "",
         "hint": "图片描述使用的模型。留空则使用默认 VLM 模型。"
+    },
+    "image_desc_concurrency": {
+        "type": "int",
+        "default": 2,
+        "hint": "后台识图的并发上限（默认 2）。识图全部在后台进行，限制并发可以避免和其它识图插件互相抢带宽、把图片 CDN 拖到超时。"
+    },
+    "image_desc_timeout": {
+        "type": "int",
+        "default": 45,
+        "hint": "单张图片识图的总时间预算（秒，含续命、下载与 VLM 调用）。超时就放弃这张图并记入失败缓存。"
+    },
+    "image_fetch_fail_ttl": {
+        "type": "string",
+        "default": "10m",
+        "hint": "图片失效/识图失败后的静默时长，如 '10m'、'30m'。这段时间内不再重复下载、不再刷日志（过期图片不会每轮都报错），到期后会自动再试一次。"
     },
     "auto_attach_recent_image": {
         "type": "switch",
