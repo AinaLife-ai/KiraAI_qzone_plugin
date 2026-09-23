@@ -111,6 +111,24 @@ class TestParseUploadResult(unittest.TestCase):
             parser.QzoneParser.parse_upload_result(bad)
 
 
+class TestParseRecentFeeds(unittest.TestCase):
+    def test_structure_is_null(self):
+        """data.data 为 null 时不能抛异常（旧写法会在 None 上 .get）。"""
+        for payload in ({}, {"data": None}, {"data": {}}, {"data": {"data": None}},
+                        {"data": {"data": {}}}):
+            self.assertEqual(parser.QzoneParser.parse_recent_feeds(payload), [], payload)
+
+    def test_one_bad_feed_does_not_kill_page(self):
+        good = {
+            "appid": "311", "uin": "10001", "key": "t1", "abstime": 1700000000,
+            "nickname": "我", "html": '<div class="f-info">内容</div>',
+        }
+        payload = {"data": {"data": [good, {"appid": "311", "uin": "x", "key": "t2",
+                                            "html": 12345}, good]}}
+        posts = parser.QzoneParser.parse_recent_feeds(payload)
+        self.assertGreaterEqual(len(posts), 1)
+
+
 class TestParseVisitors(unittest.TestCase):
     def test_dirty_counts(self):
         text = parser.QzoneParser.parse_visitors(

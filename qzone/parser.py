@@ -326,8 +326,10 @@ class QzoneParser:
     @staticmethod
     def parse_recent_feeds(data: dict) -> list[Post]:
         """解析最近说说列表"""
-        feeds: list = data.get("data", {}).get("data", {})
-        if not feeds:
+        nested = data.get("data") if isinstance(data, dict) else None
+        feeds = nested.get("data") if isinstance(nested, dict) else None
+        if not isinstance(feeds, list) or not feeds:
+            logger.debug("最近说说结构异常或为空，跳过")
             return []
         try:
             posts = []
