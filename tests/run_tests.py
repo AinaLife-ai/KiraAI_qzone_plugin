@@ -19,12 +19,15 @@ sys.path.insert(0, str(TESTS_DIR))
 MODULES = [
     'test_parser_dirty_data',
     'test_parsing_helpers',
+    'test_config_consistency',
     'test_utils_fetch',
     'test_manifest_hook',
+    'test_manifest_ondemand',
     'test_cookie_selfheal',
     'test_expired_image',
     'test_image_dedupe',
     'test_tool_flows',
+    'test_publish_paths',
     'test_lifecycle',
     'test_review_fixes',
 ]

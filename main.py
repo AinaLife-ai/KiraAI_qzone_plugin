@@ -49,11 +49,6 @@ except Exception:  # 核心路径变更时不影响插件加载
 logger = logging.getLogger(__name__)
 
 
-def _read_file_bytes(path) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-
 def _read_head_bytes(path, size: int = 16) -> bytes:
     with open(path, "rb") as f:
         return f.read(size)
@@ -81,12 +76,13 @@ IMAGE_REGISTRY_MAX_SESSIONS = 50
 URL_MD5_MAX = 500
 # 近期图片短缓存 TTL（避免同一轮内重复拉取 OneBot 历史）
 RECENT_IMAGES_TTL = 20.0
-# 识图模型不可用时的短冷却：属于配置问题，不是图片问题，配置好就能立刻用
-VLM_UNAVAILABLE_TTL = 120.0
+# 框架只在"处理过这张图"时才会写 caption：
+# - 常规模式写的是 VLM 文字描述；
+# - native 模式写的是占位串（如 "attached image"）—— 那不算文字描述，但图确实随消息
+#   发给了多模态模型（她亲眼看过），所以**一样算"框架处理过的图"**，可以进清单；
+#   展示就按原样，不擅自改写。
 # 状态落盘节流（合并多次写，异步落盘）
 STATE_FLUSH_DELAY = 2.0
-# 历史图片 URL 签名（rkey）有效期约 1 小时，超过即预判"可能已过期"
-IMAGE_URL_TTL = 3600
 
 # 启动/重载时的凭证重试退避（绝对时刻，不是累加 sleep）
 STARTUP_RETRY_DELAYS = (15, 30, 60, 120)
@@ -199,16 +195,15 @@ class QzonePlugin(BasePlugin):
         self.image_manifest_enabled = cfg.get("image_manifest_enabled", True)
         self.image_manifest_count = max(1, int(cfg.get("image_manifest_count", 5) or 5))
         # ---- 非阻塞识图 / 自愈相关配置 ----
-        self.image_desc_concurrency = max(1, int(cfg.get("image_desc_concurrency", 2) or 2))
         self.image_fetch_fail_ttl = self._parse_interval_seconds(
             cfg.get("image_fetch_fail_ttl", "10m"), default_unit="m"
         ) or 600
-        self.image_desc_timeout = max(5, int(cfg.get("image_desc_timeout", 45) or 45))
         self.image_download_timeout = max(5, int(cfg.get("image_download_timeout", 20) or 20))
-        # 清单钩子整体时间预算（毫秒），用于兜底：
-        # >0 → 允许在预算内做缓存查询；0 → 连缓存查询也不做（最保守档，
-        # 只读内存 + 触发后台任务，钩子成本恒为微秒级）。
-        self.manifest_hook_budget_ms = max(0, int(cfg.get("manifest_hook_budget_ms", 150) or 0))
+        # 清单注入策略：on_demand（默认，只在确实要发说说时注入）/ always（旧行为）
+        mode = str(cfg.get("manifest_inject_mode", "on_demand") or "on_demand").strip().lower()
+        self.manifest_inject_mode = mode if mode in ("on_demand", "always") else "on_demand"
+        # 展示用描述的长度上限（0 = 不截断）
+        self.image_desc_max_chars = max(0, int(cfg.get("image_desc_max_chars", 80) or 0))
         # OneBot 动作默认超时（秒）
         self.onebot_action_timeout = self._parse_interval_seconds(
             cfg.get("onebot_action_timeout", "5s"), default_unit="s"
@@ -242,14 +237,9 @@ class QzonePlugin(BasePlugin):
         # ---- 后台任务 / 识图调度 / 负缓存 / 自愈状态 ----
         # 统一登记的后台任务（terminate 时统一取消，避免热重载后旧任务继续跑）
         self._bg_tasks: set = set()
-        # 识图后台任务：key -> task（同一张图只会有一个任务）
-        self._desc_tasks: dict[str, asyncio.Task] = {}
-        # 识图并发闸（懒创建，绑定当前事件循环）
-        self._desc_sem: Optional[asyncio.Semaphore] = None
         # 识图负缓存：key -> 失败时间戳（TTL 内不再重试、不再刷日志）
         self._desc_failed: dict[str, float] = {}
-        # 图片缓存键 -> md5 / 已就绪描述（避免每轮重复 hash_image 与查库）
-        self._entry_md5: dict[str, str] = {}
+        # 图片缓存键 -> 已就绪描述（只放"已知描述"，供免费路径复用）
         self._entry_desc: dict[str, str] = {}
         # 近期图片短缓存：sid -> (时间戳, [url])
         self._recent_images_cache: dict[str, tuple[float, list]] = {}
@@ -1160,7 +1150,6 @@ class QzonePlugin(BasePlugin):
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             self._bg_tasks.clear()
-            self._desc_tasks.clear()
             self._state_flush_task = None
 
             # 软重置时摘下来的旧会话：延迟关闭任务可能已被取消，这里兜底关掉
@@ -1470,20 +1459,15 @@ class QzonePlugin(BasePlugin):
             candidates = await self._fetch_recent_images(source_type, source_id, max_count=fetch_count)
             candidates = [url for url in candidates if not self._is_recently_published_image(url)]
 
-            async def _describe_candidate(u: str) -> str:
-                try:
-                    async with self._get_desc_sem():
-                        return await asyncio.wait_for(
-                            self._describe_image_url(u), timeout=self.image_desc_timeout
-                        )
-                except Exception:
-                    return ""
-
-            # 并发识图（受同一个并发闸限制），保持与 candidates 的顺序一一对应
-            descs = await asyncio.gather(*[_describe_candidate(u) for u in candidates])
-            candidates_with_desc = [
-                (url, candidate_label(desc)) for url, desc in zip(candidates, descs)
-            ]
+            # 只用"已知描述"（免费路径）：没有描述的候选直接排除，
+            # 绝不为了配图去识图。顺序与 candidates 保持一致。
+            candidates_with_desc = []
+            for url in candidates:
+                desc = await self._lookup_cached_url_desc(url)
+                if desc:
+                    candidates_with_desc.append(
+                        (url, candidate_label(desc, self.image_desc_max_chars))
+                    )
             if candidates_with_desc:
                 if target_image_count > 0:
                     choice_rule = (
@@ -1673,7 +1657,11 @@ class QzonePlugin(BasePlugin):
             logger.error(f"自动回复任务失败: {e}")
 
     def _register_current_event_images(self, event: KiraMessageBatchEvent):
-        """登记本轮消息里的图片（同步、无 IO），并触发后台识图。"""
+        """登记本轮消息里的图片（同步、无 IO，绝不识图）。
+
+        此时框架已跑完 message_format_to_text（它在 ON_LLM_REQUEST 钩子之前），
+        所以本轮每张图都已经有 elem.caption / elem.md5 —— 我们只取这个免费的描述。
+        """
         if not self.image_manifest_enabled or self.auto_attach_recent_image:
             return
         sid = getattr(event, "sid", "")
@@ -1695,7 +1683,6 @@ class QzonePlugin(BasePlugin):
                          "desc": getattr(elem, "caption", None),
                          "msg_id": getattr(message, "message_id", None)}
                 registry.append(entry)
-                self._schedule_describe(entry)
         if len(registry) > IMAGE_REGISTRY_CAP:
             del registry[: len(registry) - IMAGE_REGISTRY_CAP]
         self._prune_image_registry()
@@ -1729,12 +1716,8 @@ class QzonePlugin(BasePlugin):
                     url = html.unescape(str(data.get("url") or "").strip().strip('"').strip("'"))
                     if url and not any(e.get("url") == url for e in registry):
                         entry = {"source": "url", "url": url, "sender": sender,
-                                 "time": timestamp, "desc": None, "msg_id": msg_id,
-                                 # 链接签名（rkey）约 1 小时有效：过老的历史图直接预判为
-                                 # 可能过期，走"先续命再下载"，不做注定 400 的下载
-                                 "stale": (time.time() - timestamp) > IMAGE_URL_TTL}
+                                 "time": timestamp, "desc": None, "msg_id": msg_id}
                         registry.append(entry)
-                        self._schedule_describe(entry)
             if len(registry) > IMAGE_REGISTRY_CAP:
                 del registry[: len(registry) - IMAGE_REGISTRY_CAP]
             self._prune_image_registry()
@@ -1928,13 +1911,12 @@ class QzonePlugin(BasePlugin):
                     "elem": img,
                     "sender": sender,
                     "time": stamp,
-                    # 框架/其它插件可能已给出 caption，直接复用避免重复调 VLM
+                    # 保留框架写在元素上的原始 caption（含 native 模式的占位串，
+                    # 分类时才知道"框架处理过这张图"）；没有就不进清单
                     "desc": getattr(img, "caption", None),
                     "msg_id": msg_id,
                 }
                 registry.append(entry)
-                # 把识图前移到"图片到达的那一刻"：下一轮注入清单时描述多半已就绪
-                self._schedule_describe(entry)
             if len(registry) > IMAGE_REGISTRY_CAP:
                 del registry[: len(registry) - IMAGE_REGISTRY_CAP]
             self._prune_image_registry()
@@ -1949,19 +1931,47 @@ class QzonePlugin(BasePlugin):
         for sid in list(self._image_registry)[:overflow]:
             self._image_registry.pop(sid, None)
 
-    def _manifest_entries(self, sid: str, apply_dedupe: bool = False) -> list[dict]:
-        """取该会话最近 N 张图片（保持时间顺序，供注入与序号解析共用）。
+    def _session_image_mode(self, sid: str) -> str:
+        """读该会话的识图模式（框架自己也是这么读的）。
 
-        apply_dedupe=True 时剔除去重窗口内已发布过的图片。
-        注入（钩子）与序号解析（发布）**必须用同一份过滤规则**，否则序号会错位。
+        用来给"框架没写 caption"的 native 图兜底资格：native 模式下图是原样发给
+        多模态模型的（她亲眼看过），即使框架以后不写占位串，也仍然应该能进清单。
+        """
+        try:
+            caps = self.ctx.get_session_capabilities(sid) or {}
+            rec = caps.get("image_recognition") or {}
+            return str(rec.get("mode") or "")
+        except Exception:
+            return ""
+
+    def _manifest_entries(self, sid: str, apply_dedupe: bool = False) -> list[dict]:
+        """取该会话最近 N 张**有框架描述**的图片（注入与序号解析共用同一份）。
+
+        清单的口径（明确约定）：**只列框架已经描述过、bot 真实收到过的图片**。
+        - 只走免费路径：读框架写在元素上的 caption / 内存里已知的描述；
+        - 拿不到描述 → 这张图**直接不进清单**，既不列表、也不下载、更不识图；
+        - 绝不为了"让清单有内容"而识图，也不让"我们自己识出来的图"混进清单。
+
+        apply_dedupe=True 时再剔除去重窗口内已发布过的图片。
+        注入（钩子）与序号解析（发布）必须用同一份过滤规则，否则序号会错位。
         """
         registry = self._image_registry.get(sid) or []
+        native_mode = self._session_image_mode(sid) == "native"
+
+        def qualifies(entry: dict) -> bool:
+            if self._read_entry_desc(entry):
+                return True
+            # 兜底：native 模式 + 这张图确实是她收到过的（带元素）→ 有资格。
+            # 只认带元素的条目：OneBot 历史 URL 她从没收到过，不算。
+            return native_mode and entry.get("elem") is not None
+
+        described = [entry for entry in registry if qualifies(entry)]
         if apply_dedupe:
-            registry = [
-                entry for entry in registry
+            described = [
+                entry for entry in described
                 if not self._is_recently_published_image(self._entry_source(entry))
             ]
-        return registry[-self.image_manifest_count:]
+        return described[-self.image_manifest_count:]
 
     # ---------- 图片描述：钩子只读，生产前移到"图片到达时" ----------
     def _entry_key(self, entry: dict) -> str:
@@ -1997,10 +2007,10 @@ class QzonePlugin(BasePlugin):
         return True
 
     def _mark_desc_failed(self, key: str, reason: str, ttl: Optional[float] = None):
-        """写入负缓存：TTL 内不再重试、不再刷日志（图片过期不再每轮重下）。
+        """写入负缓存：TTL 内不再重试、不再刷日志。
 
-        默认用 image_fetch_fail_ttl（内容类失败）；"识图模型不可用"这类配置问题
-        用更短的冷却（VLM_UNAVAILABLE_TTL），免得配好模型后还要等十分钟。
+        只服务「显式识图」两条路径（AI 主动调识图工具 / 可选的评论前识图）；
+        清单本身绝不识图，所以这里不影响清单。
         """
         if not key:
             return
@@ -2012,26 +2022,87 @@ class QzonePlugin(BasePlugin):
                 self._desc_failed.pop(k, None)
         logger.debug(f"图片描述暂不可用（{int(effective)}s 内不再重试）: {reason}")
 
-    def _remember_entry_desc(self, entry: dict, desc: str):
-        if not desc:
-            return
-        entry["desc"] = desc
-        key = self._entry_key(entry)
-        if key:
-            self._entry_desc[key] = desc
-        self._prune_entry_caches()
-
     def _prune_entry_caches(self):
-        for cache in (self._entry_desc, self._entry_md5, self._url_md5):
+        for cache in (self._entry_desc, self._url_md5):
             if len(cache) > URL_MD5_MAX:
                 overflow = len(cache) - URL_MD5_MAX
                 for k in list(cache)[:overflow]:
                     cache.pop(k, None)
 
-    def _get_desc_sem(self) -> asyncio.Semaphore:
-        if self._desc_sem is None:
-            self._desc_sem = asyncio.Semaphore(self.image_desc_concurrency)
-        return self._desc_sem
+    @staticmethod
+    def _classify_desc(text) -> tuple[str, bool]:
+        """把一段候选描述分类成 (展示文案, 是否有资格进清单)。
+
+        判据很朴素：**有 caption 就说明框架处理过这张图**（常规模式给 VLM 描述，
+        native 模式给 "attached image" 这类占位串）；展示一律原样，不擅自改写。
+        没有 caption（例如框架识图被关掉、或只有 OneBot 历史 URL）→ 不进清单。
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return "", False
+        return raw, True
+
+    def _should_inject_manifest(self, event) -> bool:
+        """本轮是否注入图片清单。
+
+        - ``on_demand``（默认）：只在**插件自己的定时发布任务**那一轮注入 ——
+          那是唯一"我们确定她这就要发说说、并且需要挑图"的时刻。
+          其它场合一律不注入：
+          * 常规模式下她本来就能从消息文本里看到图片（框架会写成
+            ``[Image 描述, file_path: data/temp/xxx.jpg]``），直接传 ``images`` 即可；
+          * native 模式下框架不给路径 —— 她可以带 ``want_images=true`` 调用发布工具
+            取一份候选清单（清单里包含这些图），所以也不需要我们主动注入。
+        - ``always``：保持旧行为（只要该会话有可用候选就每轮注入）。
+        """
+        if self.manifest_inject_mode == "always":
+            return True
+        return self._scheduled_publish_policy(event) is not None
+
+    async def _lookup_cached_url_desc(self, url: str) -> str:
+        """免费路径查一张 URL 图的已知描述：内存 → 同 URL 的清单条目 → 已知 md5 查共享缓存。
+
+        **绝不下载、绝不识图**：查不到就返回空串，由调用方决定丢弃这张候选。
+        """
+        if not url:
+            return ""
+        key = f"url:{clean_url(url)}"
+        cached = self._entry_desc.get(key)
+        if cached:
+            return cached
+        # 这张 URL 对应的图如果也被 bot 当消息收到过，清单条目上就有框架的 caption
+        entry = self._find_image_registry_entry("", url)
+        if entry is not None:
+            desc = self._read_entry_desc(entry)
+            if desc:
+                self._entry_desc[key] = desc
+                return desc
+        md5 = self._url_md5.get(url) or self._url_md5.get(clean_url(url))
+        if not md5:
+            return ""
+        desc = await self._cache_get_desc(md5)
+        if desc:
+            self._entry_desc[key] = desc
+        return desc
+
+    def _manifest_reply(self, entries: list) -> str:
+        """把候选清单格式化成工具回复（不发布）。
+
+        序号交给 AI 引用；真正的取图/续命由发布时在插件侧完成（所以哪怕链接过期也能救，
+        不需要把长 URL 塞进上下文）。
+        """
+        lines = []
+        for i, entry in enumerate(entries, 1):
+            desc = self._read_entry_desc(entry)
+            time_str = self._format_manifest_time(entry.get("time"))
+            sender = entry.get("sender") or "未知"
+            lines.append(f"{i}. [{time_str} {sender}] "
+                         f"{candidate_label(desc, self.image_desc_max_chars)}")
+        return (
+            "说说未发布：这是当前可用的图片清单（只包含框架已经处理过的图片）。\n"
+            + "\n".join(lines)
+            + "\n请带上 image_indices=[序号,...] 再次调用 qzone_publish 完成发布"
+              "（正文可原样保留或继续改写）；如确认发纯文字，请再次调用本工具且不要传 want_images。"
+        )
 
     def _read_entry_desc(self, entry: dict) -> str:
         """同步、无网络：只读**已经就绪**的描述（钩子唯一允许的取描述方式）。
@@ -2040,111 +2111,29 @@ class QzonePlugin(BasePlugin):
         框架的 Image.hash_image() 对 URL 型元素会真的下载图片（timeout 60s），
         且失败不缓存 md5，旧实现因此让每一轮 LLM 请求都重下一次。
         """
-        desc = entry.get("desc")
-        if desc:
-            return desc
-        key = self._entry_key(entry)
-        if key and key in self._entry_desc:
-            cached = self._entry_desc[key]
-            entry["desc"] = cached
-            return cached
         elem = entry.get("elem")
-        caption = getattr(elem, "caption", None) if elem is not None else None
-        if caption:
-            entry["desc"] = caption
-            return caption
+        key = self._entry_key(entry)
+        for candidate in (
+            entry.get("desc"),                                   # 登记时抓到的 caption
+            getattr(elem, "caption", None) if elem is not None else None,   # 元素上现成的
+            self._entry_desc.get(key) if key else None,          # 进程内已知描述
+        ):
+            display, ok = self._classify_desc(candidate)
+            if ok:
+                entry["desc"] = display
+                return display
         return ""
-
-    def _schedule_describe(self, entry: dict):
-        """触发后台描述（幂等，绝不 await）：这是钩子与登记路径的统一入口。"""
-        if not self.image_manifest_enabled or self.auto_attach_recent_image:
-            return
-        if self._read_entry_desc(entry):
-            return
-        key = self._entry_key(entry)
-        if not key or self._is_desc_failed(key):
-            return
-        task = self._desc_tasks.get(key)
-        if task is not None and not task.done():
-            return
-        task = self._spawn_task(self._describe_entry_bg(entry, key))
-        if task is not None:
-            self._desc_tasks[key] = task
-
-    async def _describe_entry_bg(self, entry: dict, key: str):
-        """后台产出描述：并发闸 + 单图整体预算 + 失败负缓存。"""
-        try:
-            if desc_img is None or self._get_vlm_client() is None:
-                # 识图模型不可用属于配置问题（不是图片问题）：短冷却即可，
-                # 同时也避免为一个注定失败的识图去白下载图片。
-                self._mark_desc_failed(key, "识图模型不可用", ttl=VLM_UNAVAILABLE_TTL)
-                return
-            async with self._get_desc_sem():
-                desc = await asyncio.wait_for(
-                    self._produce_entry_desc(entry), timeout=self.image_desc_timeout
-                )
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            self._mark_desc_failed(key, f"识图超时（>{self.image_desc_timeout}s）")
-            return
-        except Exception as e:
-            self._mark_desc_failed(key, f"识图异常: {e}")
-            return
-        finally:
-            self._desc_tasks.pop(key, None)
-        if desc:
-            self._remember_entry_desc(entry, desc)
-            logger.debug(f"清单图片描述已就绪: {key[:60]}")
-        else:
-            self._mark_desc_failed(key, "未取得有效描述")
-
-    async def _produce_entry_desc(self, entry: dict) -> str:
-        """真正干活的地方（只在后台任务里被调用）。"""
-        if entry.get("url"):
-            url = str(entry.get("url") or "")
-            if not url:
-                return ""
-            # 预判为过期的历史图：先续命，避免一次注定 400 的下载
-            if entry.get("stale") and entry.get("msg_id"):
-                await self._refresh_image_url(entry, quiet=True)
-                url = str(entry.get("url") or url)
-            result = await fetch_bytes(url, timeout=self.image_download_timeout)
-            if not result.ok and entry.get("msg_id"):
-                # 链接失效但可续命：换新签名 URL 再试一次（rkey 约 1 小时有效）
-                if await self._refresh_image_url(entry, quiet=True):
-                    url = str(entry.get("url") or url)
-                    result = await fetch_bytes(url, timeout=self.image_download_timeout)
-            if not result.ok:
-                return ""
-            return await self._describe_image_bytes(result.data, source_url=url)
-        elem = entry.get("elem")
-        if elem is None:
-            return ""
-        try:
-            path = await elem.to_path()
-        except Exception as e:
-            logger.debug(f"清单图片取本地文件失败: {e}")
-            return ""
-        if not path:
-            return ""
-        try:
-            # 同步读盘下沉线程，避免短暂阻塞事件循环
-            data = await asyncio.to_thread(_read_file_bytes, path)
-        except Exception as e:
-            logger.debug(f"清单图片读取失败: {e}")
-            return ""
-        if not looks_like_image(data[:16]):
-            return ""
-        return await self._describe_image_bytes(data)
 
     @on.llm_request()
     async def _inject_image_manifest(self, event, req: LLMRequest, tag_set, *_):
         """向本轮请求注入近期图片清单（persist=False，不落记忆）。
 
-        **钩子只读**：不下载、不调 VLM、不 sleep。未就绪的图片只触发后台任务
-        并给占位文案；由于识别已在"图片到达时"提前开始，正常情况进到这里时
-        描述已经就绪，既不会阻塞请求，也不会掉效果。
+        **钩子只读**：这里没有任何 await / 网络 / 磁盘操作，也不识图。
+        只把"框架已经描述过的图片"列出来；没有描述的图片直接不列。
+
+        为什么这样做是安全的：框架在 handle_im_batch_message 里先跑
+        message_format_to_text（给每张图 hash + 生成描述 + 写缓存 + 填 caption），
+        再触发 ON_LLM_REQUEST 钩子 —— 所以进到这里时，本轮图片的描述已经就绪。
         """
         # 吸附模式开启时彻底回到旧行为，不注入清单
         if not self.image_manifest_enabled or self.auto_attach_recent_image:
@@ -2154,30 +2143,23 @@ class QzonePlugin(BasePlugin):
             if not sid:
                 return
             self._register_current_event_images(event)
+            # 注入策略：on_demand（默认）只在"这一轮确实要发说说"时注入，
+            # 其它轮次一句都不加 —— 既不白占 token，也不在无关话题里误导模型。
+            if not self._should_inject_manifest(event):
+                return
             # 定时发布任务：从候选里剔除去重窗口内已发布过的图，
             # 从源头避免连续几条说说配同一张图（用户可见症状）。
             dedupe_active = self._scheduled_publish_policy(event) is not None
             entries = self._manifest_entries(sid, apply_dedupe=dedupe_active)
             if not entries:
                 return
-            deadline = (
-                time.monotonic() + self.manifest_hook_budget_ms / 1000.0
-                if self.manifest_hook_budget_ms
-                else None
-            )
             lines = []
             for i, entry in enumerate(entries, 1):
                 desc = self._read_entry_desc(entry)          # 同步、零 IO
-                if not desc and deadline is not None and time.monotonic() < deadline:
-                    # 预算内做**一次**缓存查询：取不到就交给后台任务（下一轮通常已就绪）
-                    budget = max(0.02, min(0.2, deadline - time.monotonic()))
-                    desc = await self._cached_desc_bounded(entry, budget)
-                if not desc:
-                    self._schedule_describe(entry)           # 只触发，不等待
-                display_desc = candidate_label(desc)
                 time_str = self._format_manifest_time(entry.get("time"))
                 sender = entry.get("sender") or "未知"
-                lines.append(f"{i}. [{time_str} {sender}] {display_desc}")
+                lines.append(f"{i}. [{time_str} {sender}] "
+                             f"{candidate_label(desc, self.image_desc_max_chars)}")
             if not lines:
                 return
             text = (
@@ -2189,26 +2171,6 @@ class QzonePlugin(BasePlugin):
             ))
         except Exception as e:
             logger.debug(f"注入图片清单失败: {e}")
-
-    async def _cached_desc_bounded(self, entry: dict, budget: float = 0.2) -> str:
-        """仅做一次带预算的缓存查询：拿不到就放弃本轮（下一轮通常已就绪）。"""
-        key = self._entry_key(entry)
-        if not key:
-            return ""
-        md5 = self._entry_md5.get(key)
-        if not md5:
-            elem = entry.get("elem")
-            md5 = getattr(elem, "md5", None) if elem is not None else None
-        if not md5:
-            return ""
-        try:
-            desc = await asyncio.wait_for(self._cache_get_desc(md5), timeout=budget)
-        except Exception:
-            return ""
-        if desc:
-            self._entry_md5[key] = md5
-            self._remember_entry_desc(entry, desc)
-        return desc
 
     async def _refresh_image_url(self, entry: dict, quiet: bool = False) -> bool:
         """图片 URL 过期时，用 get_msg 按 message_id 换取新签名 URL（rkey 续命）。
@@ -2231,7 +2193,6 @@ class QzonePlugin(BasePlugin):
                 if not url:
                     continue
                 entry["url"] = url
-                entry["stale"] = False
                 elem = entry.get("elem")
                 if elem is not None:
                     elem.image = url
@@ -2769,26 +2730,32 @@ class QzonePlugin(BasePlugin):
     # ---------- 工具注册（不检查黑名单，用户主动触发不受限制） ----------
     @register_tool(
         name="qzone_publish",
-        description="发布一条说说到自己的QQ空间。配图方式：1) images 参数传聊天中出现过的图片路径（如 data/temp/xxx.jpg，你能在聊天记录里看到这些图片的内容描述和路径）；2) image_indices 参数引用[近期图片]清单中的序号。优先使用你真正了解内容的方式配图；都不传时默认纯文字发布。",
+        description="发布一条说说到自己的QQ空间。配图：1) images 传聊天里看到过的图片路径（如 data/temp/xxx.jpg）或URL；2) image_indices 传[近期图片]清单序号。优先使用你真正了解内容的方式配图；手里没有可用路径时可传 want_images=true 先取一份候选清单（本次不会发布），再带 image_indices 调用一次。不传图即纯文字发布。",
         params={
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "说说内容"},
                 "images": {
                     "type": "array", "items": {"type": "string"},
-                    "description": "图片本地路径或URL列表（可选）。可传聊天记录里看到的图片 file_path",
+                    "description": "本地路径或URL列表（可选）",
                     "default": []
                 },
                 "image_indices": {
                     "type": "array", "items": {"type": "integer"},
-                    "description": "[近期图片]清单中的图片序号（从1开始，可选）",
+                    "description": "[近期图片]清单序号（从1开始，可选）",
                     "default": []
+                },
+                "want_images": {
+                    "type": "boolean",
+                    "description": "想配图但手里没有可用路径时传 true：只返回候选清单、不发布，你再带 image_indices 调用一次。已有图片路径时不必传。",
+                    "default": False
                 }
             },
             "required": ["text"]
         }
     )
-    async def tool_publish(self, event: KiraMessageBatchEvent, text: str, images: list = None, image_indices: list = None):
+    async def tool_publish(self, event: KiraMessageBatchEvent, text: str, images: list = None,
+                           image_indices: list = None, want_images: bool = False):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
@@ -2818,8 +2785,9 @@ class QzonePlugin(BasePlugin):
                     if task_target is None:
                         return (
                             f"未能从[近期图片]清单解析出图片（当前会话清单为空，或序号 {image_indices} 超出范围），说说未发布。"
-                            "如确认发纯文字，请不带 image_indices 重试；"
-                            "如想配图，可改用 images 参数传图片 URL 或本地路径（如 data/temp/xxx.jpg）。"
+                            "如想配图，可先传 want_images=true 取一份候选清单（本次不会发布），再带 image_indices 调用一次；"
+                            "也可改用 images 参数传图片 URL 或本地路径（如 data/temp/xxx.jpg）。"
+                            "如确认发纯文字，请不带这些参数重试。"
                         )
                     logger.info(
                         "定时发布清单选择不可用，按资源降级: target=%s indices=%s",
@@ -2829,11 +2797,24 @@ class QzonePlugin(BasePlugin):
                 valid_sources.extend(resolved)
             elif images and not valid_sources:
                 return "images 参数中的地址均无效，说说未发布。请传有效的图片 URL 或本地路径。"
-            if task_policy is not None and images:
+            if images:
+                # 显式传来的图片地址：只要是本插件登记过的（带 message_id），
+                # 就顺手用 get_msg 续命一次，避免拿过期链接去发布而失败
+                # （OneBot 历史图片的 rkey 约 1 小时就过期）。
+                # 非登记来源原样返回，没有额外开销。
                 valid_sources = await self._refresh_explicit_image_sources(
                     event.sid, valid_sources
                 )
             valid_sources = self._dedupe_sources(valid_sources)
+            # 显式请求清单：本次不发布，先把当前可用候选给她，再由她带 image_indices 调一次。
+            # 清单为空时直接继续发布（不让她白跑一趟）。
+            if want_images and not image_indices and not valid_sources:
+                entries = self._manifest_entries(
+                    event.sid, apply_dedupe=task_policy is not None
+                )
+                if entries:
+                    return self._manifest_reply(entries)
+                logger.info("want_images=true 但当前没有可用候选，按纯文字继续发布")
             if task_target is not None:
                 if task_target > 0:
                     valid_sources = await self._fill_scheduled_publish_sources(
@@ -2883,11 +2864,11 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_view",
-        description="查看QQ空间说说。如果不提供target_id，默认查看自己的空间；要查看好友动态，请提供好友QQ号。返回的每条说说包含ID、发布时间、配图数量和最新评论。如果说说有配图且你需要了解图片内容（比如对方文字暗示了图片、或你打算认真评论），可调用 qzone_describe_image。",
+        description="查看QQ空间说说。不传 target_id 看自己的空间，传好友QQ号看好友动态；返回每条说说的 ID、时间、配图数与最新评论。需要了解某张配图内容时可再调 qzone_describe_image。",
         params={
             "type": "object",
             "properties": {
-                "target_id": {"type": "string", "description": "目标QQ号（可选）"},
+                "target_id": {"type": "string", "description": "目标QQ号（可选，默认自己）"},
                 "num": {"type": "integer", "description": "查看条数，默认1", "default": 1}
             },
         }
@@ -3028,13 +3009,13 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_describe_image",
-        description="查看说说中某张配图的实际内容。他人的说说：当文字暗示图片很重要或你打算评论前想了解图片内容时调用。自己的说说：一般不要调用（配图本来就是你选的），仅当确有必要时再用，如想确认当时配的图是否合适或回复评论前需回顾图片内容。",
+        description="查看说说中某张配图的实际内容。他人的说说：文字暗示了图片、或你打算评论前想了解内容时调用。自己的说说一般不必调用（确有必要时除外，如确认当时配图是否合适）。",
         params={
             "type": "object",
             "properties": {
                 "target_id": {"type": "string", "description": "说说作者的QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
-                "index": {"type": "integer", "description": "第几张图片（从1开始），默认1", "default": 1}
+                "index": {"type": "integer", "description": "第几张图（从1开始，默认1）", "default": 1}
             },
             "required": ["target_id", "tid"]
         }
@@ -3076,7 +3057,7 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_visitors",
-        description="查看自己QQ空间最近访客和访客统计。返回最近访客明细、来源、隐身/黄钻状态，以及今日和最近30天访客数。仅支持查看当前登录账号自己的空间。",
+        description="查看自己QQ空间最近访客与访客统计（最近访客明细、来源、隐身/黄钻状态、今日与最近30天访客数）。仅限自己空间。",
         params={
             "type": "object",
             "properties": {},
@@ -3099,13 +3080,13 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_like",
-        description="给指定说说点赞，或取消已点的赞（同一工具两职）。用户要求点赞（如“赞一下/点个赞”）用默认 action=like；用户要求取消点赞（如“取消赞/去掉赞/取消点赞”）时必须传 action=unlike。",
+        description="给指定说说点赞或取消点赞（同一工具两职）。用户说“点赞/赞一下”用默认 action=like；说“取消赞/去掉赞”必须传 action=unlike。",
         params={
             "type": "object",
             "properties": {
                 "target_id": {"type": "string", "description": "目标QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
-                "action": {"type": "string", "description": "操作类型：like=点赞（默认），unlike=取消点赞", "enum": ["like", "unlike"]}
+                "action": {"type": "string", "description": "like=点赞（默认），unlike=取消点赞", "enum": ["like", "unlike"]}
             },
             "required": ["target_id", "tid"]
         }
@@ -3152,13 +3133,13 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_comment",
-        description="评论指定的说说，如果不提供内容则AI自动生成。",
+        description="评论指定的说说。不传 content 则自动生成一条评论。",
         params={
             "type": "object",
             "properties": {
-                "target_id": {"type": "string", "description": "目标QQ号"},
+                "target_id": {"type": "string", "description": "说说作者的QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
-                "content": {"type": "string", "description": "评论内容（可选）"}
+                "content": {"type": "string", "description": "评论内容（可选，不传自动生成）"}
             },
             "required": ["target_id", "tid"]
         }
@@ -3227,7 +3208,7 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_delete",
-        description="删除自己的一条说说",
+        description="删除自己的一条说说。",
         params={
             "type": "object",
             "properties": {
@@ -3249,14 +3230,14 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_delete_comment",
-        description="删除指定评论（主评论或楼中回复均可）。支持删除自己空间说说下的任意评论，或删除自己发布在别人说说下的评论/回复。评论 ID 和作者 UIN 从 qzone_view 获取；楼中回复建议同时传 comment_uin 精确定位。",
+        description="删除一条评论（主评论或楼中回复均可）。支持删自己空间说说下的任意评论，或删自己发在别人说说下的评论/回复。",
         params={
             "type": "object",
             "properties": {
-                "target_id": {"type": "string", "description": "说说作者的QQ号（删自己空间评论就填自己的QQ号）"},
+                "target_id": {"type": "string", "description": "说说作者的QQ号（删自己空间的评论就填自己）"},
                 "tid": {"type": "string", "description": "说说ID"},
-                "comment_id": {"type": "string", "description": "要删除的评论ID（主评论或楼中回复的ID均可）"},
-                "comment_uin": {"type": "string", "description": "评论作者QQ号（可选；楼中回复建议传，用于精确定位）"}
+                "comment_id": {"type": "string", "description": "要删除的评论ID（从 qzone_view 获取）"},
+                "comment_uin": {"type": "string", "description": "评论作者QQ号（可选，楼中回复建议传）"}
             },
             "required": ["target_id", "tid", "comment_id"]
         }
@@ -3324,15 +3305,15 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_reply_comment",
-        description="回复指定评论。先从 qzone_view 获取评论 ID 和 UIN；当同一说说内 ID 重复时必须同时传 comment_uin，避免回复错人。",
+        description="回复某条评论。评论 ID 与作者 UIN 从 qzone_view 获取；同一说说内评论 ID 重复时必须同时传 comment_uin。",
         params={
             "type": "object",
             "properties": {
                 "target_id": {"type": "string", "description": "说说作者的QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
                 "comment_id": {"type": "string", "description": "要回复的评论ID"},
-                "comment_uin": {"type": "string", "description": "评论作者QQ号；同一说说内评论ID重复时必填"},
-                "content": {"type": "string", "description": "回复内容（可选）"}
+                "comment_uin": {"type": "string", "description": "评论作者QQ号（同一说说内评论ID重复时必填）"},
+                "content": {"type": "string", "description": "回复内容（可选，不传自动生成）"}
             },
             "required": ["target_id", "tid", "comment_id"]
         }

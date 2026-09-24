@@ -1,5 +1,6 @@
 """工具全流程回归：八个工具在桩件下必须保持原有语义与返回文案。"""
 import asyncio
+import pathlib
 import time
 
 import _bootstrap as B
@@ -183,6 +184,8 @@ class TestCommentAndLike(ToolFlowCase):
 
 
 class TestDeleteAndReply(ToolFlowCase):
+    """删除 / 评论 / 回复评论：两个工具各自独立，互不越界。"""
+
     def test_delete_post(self):
         self.assertEqual(self.call('tool_delete', tid="t1"), "说说 t1 删除成功")
 
@@ -190,14 +193,107 @@ class TestDeleteAndReply(ToolFlowCase):
         out = self.call('tool_delete_comment', target_id="10001", tid="t1", comment_id="c1")
         self.assertEqual(out, "评论删除成功")
 
-    def test_reply_comment(self):
+    def _with_one_comment(self):
         self.api.detail = detail_msg(tid="t1", comments=[
-            {"tid": "c1", "uin": 20002, "name": "小王", "content": "在吗",
+            {"tid": "1", "uin": 20002, "name": "小王", "content": "在吗",
              "create_time": 1700000000, "commentid": "c1"},
         ])
+
+    # ── 结构层：两个工具的参数边界（防误用的第一道闸）──────────────
+    def test_tool_schemas_are_separate(self):
+        """qzone_comment 不该有 comment_id；qzone_reply_comment 必须有。"""
+        import ast
+        src = open(pathlib.Path(B.ROOT) / 'main.py', encoding='utf-8').read()
+        decls = {}
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if not ((isinstance(f, ast.Name) and f.id == 'register_tool') or
+                    (isinstance(f, ast.Attribute) and f.attr == 'register_tool')):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            name = getattr(kw.get('name'), 'value', None)
+            if name:
+                p = ast.literal_eval(kw['params'])
+                decls[name] = (sorted(p.get('properties', {})), sorted(p.get('required', [])))
+        c_props, c_req = decls['qzone_comment']
+        r_props, r_req = decls['qzone_reply_comment']
+        self.assertEqual(c_props, ['content', 'target_id', 'tid'])
+        self.assertNotIn('comment_id', c_props, '评论工具不该有 comment_id（否则可能被误用成回复）')
+        self.assertEqual(c_req, ['target_id', 'tid'])
+        self.assertIn('comment_id', r_props)
+        self.assertIn('comment_id', r_req, '回复工具的 comment_id 必须是必填')
+
+    # ── 行为层：各走各的路 ────────────────────────────────────────
+    def test_comment_does_not_reply(self):
+        self._with_one_comment()
+        out = self.call('tool_comment', target_id="10001", tid="t1", content="不错")
+        self.assertEqual(out, "评论成功")
+        called = [c[0] for c in self.api.calls]
+        self.assertIn("comment", called)
+        self.assertNotIn("reply", called, '评论工具不该走回复分支')
+
+    def test_reply_does_not_comment(self):
+        self._with_one_comment()
         out = self.call('tool_reply_comment', target_id="10001", tid="t1",
                         comment_id="c1", content="在的")
         self.assertEqual(out, "回复成功: 在的")
+        called = [c[0] for c in self.api.calls]
+        self.assertIn("reply", called)
+        self.assertNotIn("comment", called, '回复工具不该走评论分支')
+
+    def test_reply_with_unknown_comment_id(self):
+        self._with_one_comment()
+        out = self.call('tool_reply_comment', target_id="10001", tid="t1", comment_id="不存在")
+        self.assertIn("未找到指定的评论 ID", out)
+        self.assertNotIn("reply", [c[0] for c in self.api.calls])
+
+    def test_reply_with_ambiguous_id_asks_for_uin(self):
+        self.api.detail = detail_msg(tid="t1", comments=[
+            {"tid": "1", "uin": 20002, "name": "小王", "content": "a",
+             "create_time": 1700000000, "commentid": "same"},
+            {"tid": "2", "uin": 30003, "name": "小李", "content": "b",
+             "create_time": 1700000000, "commentid": "same"},
+        ])
+        out = self.call('tool_reply_comment', target_id="10001", tid="t1", comment_id="same")
+        self.assertIn("不唯一", out)
+        self.assertIn("comment_uin", out)
+        self.assertNotIn("reply", [c[0] for c in self.api.calls])
+
+    def test_reply_with_uin_disambiguates(self):
+        self.api.detail = detail_msg(tid="t1", comments=[
+            {"tid": "1", "uin": 20002, "name": "小王", "content": "a",
+             "create_time": 1700000000, "commentid": "same"},
+            {"tid": "2", "uin": 30003, "name": "小李", "content": "b",
+             "create_time": 1700000000, "commentid": "same"},
+        ])
+        out = self.call('tool_reply_comment', target_id="10001", tid="t1",
+                        comment_id="same", comment_uin="30003", content="回你")
+        self.assertEqual(out, "回复成功: 回你")
+        reply_calls = [c for c in self.api.calls if c[0] == "reply"]
+        self.assertEqual(len(reply_calls), 1)
+        self.assertEqual(reply_calls[0][2], 2, '应回复 uin=30003 的那条（tid=2）')
+
+    def test_reply_auto_generates_content(self):
+        self._with_one_comment()
+
+        async def fake_llm(*a, **kw):
+            return "自动回复"
+
+        self.plugin._call_llm = fake_llm
+        out = self.call('tool_reply_comment', target_id="10001", tid="t1", comment_id="c1")
+        self.assertIn("回复成功", out)
+        self.assertIn("自动回复", out)
+
+    def test_comment_path_still_idempotent(self):
+        self.api.detail = detail_msg(tid="t1", comments=[
+            {"tid": "1", "uin": 10001, "name": "我", "content": "不错",
+             "create_time": 1700000000, "commentid": "c1"},
+        ])
+        out = self.call('tool_comment', target_id="10001", tid="t1", content="不错")
+        self.assertIn("未重复提交", out)
+        self.assertNotIn("comment", [c[0] for c in self.api.calls])
 
     def test_visitors(self):
         out = self.call('tool_visitors')

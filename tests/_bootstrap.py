@@ -149,7 +149,15 @@ class KiraMessageEvent(_Simple):
 
 
 class KiraMessageBatchEvent(_Simple):
-    pass
+    def is_group_message(self):
+        for m in getattr(self, "messages", None) or []:
+            if getattr(m, "group", None) is not None:
+                return True
+        sess = getattr(self, "session", None)
+        return getattr(sess, "session_type", "") == "gm"
+
+    def is_private_message(self):
+        return not self.is_group_message()
 
 
 class MessageChain(list):
@@ -259,6 +267,8 @@ class FakeSession:
 class FakeAdapter:
     def __init__(self, name='qq_ada', send_result=None, error=None, platform='QQ'):
         self.info = _Simple(name=name, platform=platform, adapter_id='aid-' + name, enabled=True)
+        self.config = {"self_id": "10001"}          # 真实适配器有 config（合成事件读 self_id）
+        self.message_types = ["text", "img"]
         self.permanently_disconnected = False
         self._send_result = send_result if send_result is not None else {'status': 'ok', 'data': {}}
         self._error = error
@@ -378,6 +388,8 @@ class FakeCtx:
 
 
 DEFAULT_CFG = {
+    # 既有用例按"每轮注入"的旧语义写；on_demand 由专门用例覆盖
+    'manifest_inject_mode': 'always',
     'auto_refresh_cookie': True,
     'image_manifest_enabled': True,
     'image_manifest_count': 5,
@@ -437,13 +449,6 @@ class LoopTestCase(_unittest.TestCase):
 
     def run_(self, coro):
         return self.loop.run_until_complete(coro)
-
-    def kick_describe(self, plugin, *entries):
-        """在事件循环内触发识图调度（生产环境也是从消息处理协程里触发的）。"""
-        async def _go():
-            for entry in entries:
-                plugin._schedule_describe(entry)
-        return self.run_(_go())
 
 
 def patch_shared_session(responses):
