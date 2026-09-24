@@ -26,8 +26,20 @@ def dedupe_sources(sources: list[str]) -> list[str]:
     return list(dict.fromkeys(source for source in sources if source))
 
 
-def candidate_label(description: str | None) -> str:
-    return description or "图片内容暂未识别（仍可作为配图选择）"
+DEFAULT_DESC_MAX_CHARS = 80
+
+
+def candidate_label(description: str | None, max_chars: int = 0) -> str:
+    """清单/提示词里展示的图片描述。
+
+    max_chars > 0 时截断（默认不截断，由调用方传入配置值）——识图模型对
+    「图片里有文字」会把文字全输出，截图类描述可能几百字，5 张就能上千字符，
+    而这段文本每一轮都会进 prompt，所以展示层必须能截。
+    """
+    text = description or "图片内容暂未识别（仍可作为配图选择）"
+    if max_chars and len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
 
 
 def resolve_described_sources(

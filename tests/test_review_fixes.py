@@ -83,10 +83,12 @@ class TestReloadUnlock(B.LoopTestCase):
 
 
 class TestManifestRobustness(B.LoopTestCase):
+    """清单相关：钩子只读 + 脏值容错（只列框架已描述的图片）。"""
+
     def _entries(self, times):
         return [
             {"source": "url", "url": f"https://x/{i}.jpg", "sender": "A",
-             "time": t, "desc": "描述", "msg_id": None}
+             "time": t, "desc": "框架给的描述", "msg_id": None}
             for i, t in enumerate(times)
         ]
 
@@ -97,51 +99,26 @@ class TestManifestRobustness(B.LoopTestCase):
         self.run_(plugin._inject_image_manifest(
             B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
         self.assertEqual(len(req.user_prompt), 1, "单条时间脏值不能让整份清单消失")
-        self.assertIn("描述", req.user_prompt[0].text)
+        self.assertIn("框架给的描述", req.user_prompt[0].text)
+        self.assertIn("时间未知", req.user_prompt[0].text)
 
-    def test_cached_description_used_in_same_round(self):
-        """库里已有描述时，本轮就应该用上（预算允许的前提下）。"""
+    def test_hook_never_reads_database(self):
+        """钩子只读内存里的描述：连共享缓存都不查（因此不可能阻塞）。"""
         plugin, ctx = B.make_plugin()
-
-        async def fast_db(md5):
-            # 与真实 ctx.db.get_image_desc_cache 的返回形状一致
-            return {"md5": md5, "description": "库里的描述", "count": 1, "last_seen": 0}
-
-        ctx.db.get_image_desc_cache = fast_db
-        entry = {"source": "url", "url": "https://x/1.jpg", "sender": "A",
-                 "time": int(time.time()), "desc": None, "msg_id": None}
-        plugin._image_registry[SID] = [entry]
-        plugin._entry_md5[plugin._entry_key(entry)] = "deadbeef"
-        req = B.LLMRequest()
-        self.run_(plugin._inject_image_manifest(
-            B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
-        self.assertIn("库里的描述", req.user_prompt[0].text)
-
-    def test_budget_zero_skips_db_lookup(self):
-        """预算 0 的语义是"完全不查缓存"（最保守档），不是"不限制"。"""
-        plugin, ctx = B.make_plugin(cfg={'manifest_hook_budget_ms': 0})
         calls = []
 
         async def counting_db(md5):
             calls.append(md5)
-            return {"md5": md5, "description": "库里的描述", "count": 1, "last_seen": 0}
+            return None
 
         ctx.db.get_image_desc_cache = counting_db
-        entry = {"source": "url", "url": "https://x/1.jpg", "sender": "A",
-                 "time": int(time.time()), "desc": None, "msg_id": None}
-        plugin._image_registry[SID] = [entry]
-        plugin._entry_md5[plugin._entry_key(entry)] = "deadbeef"
-        req = B.LLMRequest()
-        self.run_(plugin._inject_image_manifest(
-            B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
-        self.assertEqual(calls, [], "预算 0 时不应做任何缓存查询")
-        self.assertIn("暂未识别", req.user_prompt[0].text)
-
-    def test_budget_zero_still_returns(self):
-        """预算为 0（不限制）时也必须正常返回，不抛异常。"""
-        plugin, ctx = B.make_plugin(cfg={'manifest_hook_budget_ms': 0})
         plugin._image_registry[SID] = self._entries([int(time.time())])
-        req = B.LLMRequest()
         self.run_(plugin._inject_image_manifest(
-            B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), req, None))
-        self.assertEqual(len(req.user_prompt), 1)
+            B.KiraMessageBatchEvent(sid=SID, messages=[], session=None), B.LLMRequest(), None))
+        self.assertEqual(calls, [], "钩子里不应发生任何数据库查询")
+
+    def test_soft_reset_still_works(self):
+        plugin, ctx = B.make_plugin()
+        self.run_(plugin._soft_reset_connection('测试'))
+        self.assertIsNone(plugin.api)
+        self.assertEqual(plugin._last_cookie_refresh, 0.0)

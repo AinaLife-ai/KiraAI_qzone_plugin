@@ -231,10 +231,16 @@
         "default": 5,
         "hint": "近期图片清单包含的图片数量（每会话）。"
     },
-    "manifest_hook_budget_ms": {
+    "manifest_inject_mode": {
+        "type": "string",
+        "enum": ["on_demand", "always"],
+        "default": "on_demand",
+        "hint": "图片清单注入策略。on_demand（默认）= 只在插件自己的定时发布任务那一轮注入（那是唯一确定「她这就要发说说、并且需要挑图」的时刻）；用户在聊天里让她发说说不需要清单——她自己能从消息文本里看到图片路径，真需要清单时空手调用 qzone_publish 也会按需返回。always = 旧行为（该会话有可用候选就每轮注入）。注意：清单只列「框架已经处理过」的图片（含 native 模式随消息发出的图），没处理过的不列、不下载、也不额外识图。"
+    },
+    "image_desc_max_chars": {
         "type": "int",
-        "default": 150,
-        "hint": "注入图片清单时的整体时间预算（毫秒），默认 150。清单读取只查缓存、绝不下载，所以正常远低于该预算（实测内存命中约 1ms、数据库极慢时也不会超过该预算 +20ms），只用于兜底。填 0 = 连缓存查询也不做（最保守档：只读内存 + 触发后台任务）。"
+        "default": 80,
+        "hint": "清单/提示词里每张图描述的展示长度上限（默认 80 字，超出截断并加省略号；填 0 = 不截断）。识图模型对「图片里有文字」会把文字全部输出，截图类描述可能几百字，而这段文本是按张数进 prompt 的，所以建议保留上限。"
     },
     "qzone_image_desc_enabled": {
         "type": "switch",
@@ -256,16 +262,6 @@
         "model_type": "llm",
         "default": "",
         "hint": "图片描述使用的模型。留空则使用默认 VLM 模型。"
-    },
-    "image_desc_concurrency": {
-        "type": "int",
-        "default": 2,
-        "hint": "后台识图的并发上限（默认 2）。识图全部在后台进行，限制并发可以避免和其它识图插件互相抢带宽、把图片 CDN 拖到超时。"
-    },
-    "image_desc_timeout": {
-        "type": "int",
-        "default": 45,
-        "hint": "单张图片识图的总时间预算（秒，含续命、下载与 VLM 调用）。超时就放弃这张图并记入失败缓存。"
     },
     "image_fetch_fail_ttl": {
         "type": "string",

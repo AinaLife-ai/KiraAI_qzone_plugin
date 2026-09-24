@@ -34,17 +34,18 @@ class TestStartup(B.LoopTestCase):
         ada = B.FakeAdapter('qq_ada', send_result={'status': 'ok', 'data': {'cookies': COOKIES}})
         plugin, ctx = B.make_plugin(adapters={'qq_ada': ada})
 
-        async def slow_fetch(url, **kw):
-            await asyncio.sleep(30)
-            return B.fetch_result(False, reason='不该跑到这里')
-
-        B.patch_fetch_bytes(slow_fetch)
         self.run_(plugin.initialize())
-        # 制造一个后台识图任务和一个待落盘的状态变更
-        entry = {"source": "url", "url": "https://x/slow.jpg", "sender": "A",
-                 "time": 1, "desc": None, "msg_id": None}
-        self.kick_describe(plugin, entry)
-        self.run_(asyncio.sleep(0.1))
+
+        # 制造一个进行中的后台任务 + 一个待落盘的状态变更
+        async def long_wait():
+            await asyncio.sleep(30)
+
+        async def setup():
+            plugin._save_state()                # 制造一个待落盘的状态变更
+            plugin._spawn_task(long_wait())     # 制造一个进行中的后台任务
+
+        self.run_(setup())
+        self.run_(asyncio.sleep(0.05))
         remaining = [t for t in plugin._bg_tasks if not t.done()]
         self.assertTrue(remaining, "应存在进行中的后台任务")
 
