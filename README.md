@@ -119,7 +119,7 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 | `auto_reply_enabled` | boolean | 否 | 是否开启自动回复评论（需配置 `auto_reply_schedule`）。 |
 | `task_group_ids` | string | 否 | **群聊指令模式**：接收定时任务指令的群号列表（多个用英文逗号分隔）。每次定时任务会随机选择一个群发送指令。 |
 | `task_private_ids` | string | 否 | **群聊指令模式**：接收定时任务指令的个人QQ号列表（多个用英文逗号分隔）。 |
-| `task_message_style` | enum | 否 | 通用任务消息样式：`silent`=AI 静默执行任务，群里完全看不到她的回复（真无痕，推荐）；`notify`=保留 AI 的回复消息。 |
+| `task_message_style` | enum | 否 | 通用任务消息样式：`silent`=**只压制「定时任务旁白」**（任务汇报类发言被过滤），任务途中回应群友的消息照常发出，不会整轮静默；`notify`=保留全部回复。<br>注：真正的「完全无痕」由指令提示词保证 —— silent 轮次的指令会明确要求模型除调用工具外不发群消息（框架原生 `<msg/>` 语法），而不是靠事后清空消息列表。 |
 | `auto_publish_group_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的群号（仅当未配置任何任务目标时生效）。 |
 | `auto_publish_user_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的个人QQ号（仅当未配置任何任务目标且未配置群号时生效）。 |
 | `auto_publish_image_prob` | float | 否 | 主动发布进入配图候选流程的概率（0-1），默认 1。进入后会把近期图片清单提供给 AI。 |
