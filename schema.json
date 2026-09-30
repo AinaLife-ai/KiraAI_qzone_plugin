@@ -118,7 +118,7 @@
         "type": "string",
         "enum": ["silent", "notify"],
         "default": "silent",
-        "hint": "定时任务消息样式：silent=只压制「定时任务旁白」（任务汇报类发言），任务途中回应群友的消息照常发出；notify=保留全部回复。注意 silent 不会整轮静默——那是框架原生 <msg/> 的职责，由指令提示词负责"
+        "hint": "silent=只压制任务汇报类旁白（回应群友的消息照常发出）；notify=保留全部回复"
     },
     "auto_publish_group_id": {
         "type": "string",
