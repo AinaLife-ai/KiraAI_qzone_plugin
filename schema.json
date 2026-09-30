@@ -118,7 +118,7 @@
         "type": "string",
         "enum": ["silent", "notify"],
         "default": "silent",
-        "hint": "silent=只压制任务汇报类旁白（回应群友的消息照常发出）；notify=保留全部回复"
+        "hint": "silent=指令层要求 AI 静默执行、不要汇报；notify=不附加该要求"
     },
     "auto_publish_group_id": {
         "type": "string",

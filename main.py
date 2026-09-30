@@ -89,23 +89,6 @@ MANIFEST_FRESH_TTL = 300.0
 
 # 启动/重载时的凭证重试退避（绝对时刻，不是累加 sleep）
 STARTUP_RETRY_DELAYS = (15, 30, 60, 120)
-
-# silent 模式要压制的「定时任务旁白」关键词。
-# 只在这批消息由 qzone_task 触发（_is_task_batch）且整条为纯文本时才比对，
-# 命中即判为"她在群里汇报任务"→ 压制（silent 契约）；
-# 任何非文本元素（reply/at/图片）都不会走到这里，保证"回应群友"永不误伤。
-TASK_NARRATION_KEYWORDS = (
-    "定时任务",
-    "定时说说",
-    "定时发布",
-    "定时评论",
-    "定时回复",
-    "自动发布任务",
-    "自动评论任务",
-    "自动回复任务",
-    "说说发布成功",
-    "说说已发布",
-)
 # 软重置后等待恢复的观察窗口（秒），超时才升级到"真重载"
 SELF_HEAL_PROBE_TIMEOUT = 60.0
 
@@ -117,10 +100,6 @@ REFRESH_THROTTLE = 10
 
 
 class QzonePlugin(BasePlugin):
-    # silent 模式要压制的「定时任务旁白」特征词（见 _silent_task_guard）。
-    # 挂成类属性：既便于测试逐项断言，也允许子类/用户按需覆盖。
-    TASK_NARRATION_KEYWORDS = TASK_NARRATION_KEYWORDS
-
     def __init__(self, ctx, cfg):
         super().__init__(ctx, cfg)
         self.cfg = cfg
@@ -1319,7 +1298,7 @@ class QzonePlugin(BasePlugin):
         with_place: bool = True,
         task_extra: Optional[dict] = None,
     ) -> bool:
-        """发送定时任务指令（合成内部事件，带 qzone_task 标记供 silent 模式识别）
+        """发送定时任务指令（合成内部事件，带 qzone_task 标记与配图参数供下游逻辑识别）
 
         with_place=False 用于评论/回复任务：操作对象是空间说说，与会话场合无关，
         附加场合信息反而会误导 AI。
@@ -1349,19 +1328,19 @@ class QzonePlugin(BasePlugin):
                 place = f"与「{nickname}」{target_id} 的私聊" if nickname else f"与 {target_id} 的私聊"
                 instruction_text += f"\n（当前场合：{place}）"
 
-        # silent 轮次：把「别在群里说话」写进指令本身（釜底抽薪）。
+        # silent 轮次：静默**只在指令层**达成（v1.4.10 起不再拦截任何消息）。
         #
-        # 为什么必须写在这里：框架原生就有"不发送任何消息"的合法写法 —— 输出
-        # `<msg/>`（提示词 format 段原文：「特殊的，你可以输出以下内容实现不发送消息」），
-        # 解析后 MessageChain 为空、框架直接跳过，**完全不需要任何插件去清 actions**。
-        # 旧实现没说这一条，模型于是产出了正经的聊天回复，插件再在 AFTER_XML_PARSE
-        # 里整轮清空 —— 既吞掉了任务途中的插话回复，又和 Midflight 的
-        # 「先输出 <msg> 回应，再继续调用工具」引导语正面冲突。
+        # 框架原生支持"不发送任何消息"：输出 `<msg/>`（提示词 format 段原文：
+        # 「特殊的，你可以输出以下内容实现不发送消息」），解析后 MessageChain 为空、
+        # 框架直接跳过。只要指令说清楚，插件就完全不需要去动消息列表。
+        #
+        # ⚠️ 绝不要在 AFTER_XML_PARSE 钩子里删改 actions —— 那是唯一发送入口，
+        # 解析后没有任何撤回/补发通道，删掉 = 这一轮消息永久丢失（v1.4.9 的故障）。
         if self.task_message_style == "silent":
             instruction_text += (
-                "\n（本轮静默执行：**照常调用工具完成任务**，只是不要在群里发言——"
-                "如果不需要向群友说话，直接输出 <msg/> 即可（这是系统的「不发送消息」标记）。"
-                "不要汇报、不要解释、不要提及本次任务。）"
+                "\n（本轮静默执行：**照常调用工具完成任务**，需要回应群友时照常回应；"
+                "只是不要汇报、不要解释、不要提及本次任务 —— 不需要说话时，"
+                "直接输出 <msg/> 即可（这是系统的「不发送消息」标记）。）"
             )
 
         adapter = self._ada_obj
@@ -1400,130 +1379,6 @@ class QzonePlugin(BasePlugin):
         await self.ctx.message_processor.handle_im_message(event)
         logger.info(f"已向 {sid} 发送指令: {instruction_text[:30]}...")
         return True
-
-    @staticmethod
-    def _is_task_batch(event) -> bool:
-        """该批次是否由本插件的合成定时任务事件触发（只看标记，不看内容）。"""
-        for m in getattr(event, "messages", None) or []:
-            extra = getattr(m, "extra", None) or {}
-            if extra.get("qzone_task"):
-                return True
-        return False
-
-    @on.after_xml_parse()
-    async def _silent_task_guard(self, event, actions, *_):
-        """silent 模式：只压制定时任务这一轮的「旁白」，绝不整轮丢弃。
-
-        ★ 为什么必须逐条过滤，而不是 actions.clear()（v1.4.10 修复）
-
-        框架的 send_xml_messages 是**唯一**发送入口，解析后没有任何撤回/补发通道：
-
-            actions = await self._parse_xml_msg(xml_data, tag_set)
-            # EventType.AFTER_XML_PARSE  ← 原来在这里 actions.clear()
-            for action in actions:
-                await self.send_message_chain(event.sid, action)
-
-        所以在这个钩子里 actions.clear() = **这一轮模型产出的全部消息永久丢失**。
-        框架只会照常打印 `LLM -> ...`，用户却一条都收不到。
-
-        ★ 而「这一轮」远不止「定时任务那一句话」
-
-        定时发布常常要跑几分钟（实测日志里首步 67s + 中间 5 个工具步）。期间
-        Midflight 会把群友的插话注入到同一轮的 tool_result 里，模型按引导语
-        「先输出 <msg> 回应插话，再继续调用工具」产出的回复，也落在同一批 actions 中。
-        整轮清空会把这些**本该发出去的群聊回复**一起吞掉 —— 这正是用户报的
-        「明明没发空间，消息也消失了」。
-
-        ★ 日志上的判据（**修正版**，旧版判据是错的）
-
-        框架的 _add_message_ids() 只在 `i < len(message_results)` 时才写入
-        message_id，**没有** else 分支去删除模型自己写的属性：
-
-            for i, msg in enumerate(root.findall("msg")):
-                if i < len(message_results):        # results 为空 ⇒ 一次都不进
-                    msg.set("message_id", ...)
-
-        因此**不能**用"有没有 message_id"判断是否被吞：模型常常模仿上文格式
-        （或纯粹幻觉）自己写一串 id，清空 actions 之后日志里照样显示 ——
-        看着像"发出去了"，实际一条都没发。
-
-        真正可靠的判据（按可靠性排序）：
-
-        1. **QQ 客户端对质**（唯一权威）：bot 账号在自己群里，去看那几条消息
-           是否真实存在。
-        2. **`ON_MESSAGE_SENT` 钩子的 result.ok / result.err**：框架每发一条
-           都会派发该钩子；被清空的轮次**一条都不会派发**。
-           临时把插件的 logger.debug 改成 logger.info 即可看到。
-        3. **`event.stop()` 的返回路径**：send_xml_messages 在 AFTER_XML_PARSE
-           阶段被 stop 时会 `return None`，日志会打 "stopped while AFTER_XML_PARSE"。
-           （本项目用的是 actions.clear()，不是 stop()，所以这条不适用。）
-
-        所以：**别再用 message_id 空/非空做判据**。这也是本版修复要把
-        "清空"改成"逐条过滤"的根本原因 —— 让日志与事实重新对齐。
-
-        ★ 修法（silent 语义重新对齐）
-
-        silent 的本意是「别在群里刷『我在执行定时任务』的旁白」，而不是
-        「这一轮什么都不能说」。因此：
-
-        - 纯文本 + 命中任务旁白特征 → 压制（真无痕）；
-        - 带 reply / at / 图片等元素，或没命中旁白 → 保留（那是她在回应插话）；
-        - 任何判断异常都不拦（宁可多发，也绝不吞）。
-        """
-        if self.task_message_style != "silent":
-            return
-        if not self._is_task_batch(event):
-            return
-
-        def _is_task_narration(chain) -> bool:
-            """一条 MessageChain 是不是「定时任务旁白」。
-
-            只有"清一色纯文本 + 命中旁白关键词"才算；出现任何非文本元素
-            （reply / at / image / emoji …）都说明它指向具体某人或带内容，一律保留。
-            """
-            if not isinstance(chain, MessageChain):
-                return False
-            for ele in chain:
-                if not isinstance(ele, Text):
-                    return False
-            text = "".join(
-                (ele.text or "") for ele in chain if isinstance(ele, Text)
-            ).strip()
-            if not text:
-                return False
-            return any(kw in text for kw in self.TASK_NARRATION_KEYWORDS)
-
-        try:
-            kept, suppressed = [], []
-            for action in actions:
-                if isinstance(action, MessageChain) and _is_task_narration(action):
-                    suppressed.append(action)
-                else:
-                    kept.append(action)
-
-            # ★ 绝对安全闸：绝不把本批压空。
-            # 若这一轮的全部产出都是旁白（没有任何其它消息），**保留不压**。
-            # 代价是偶尔漏出一句"我去发条说说"；收益是永远不可能出现
-            # "模型说了话、用户却一条都收不到"的吞消息。
-            # 真无痕应该由提示词层达成（silent 轮次明确要求输出 `<msg/>`，
-            # 那是框架原生的"不发送任何消息"语法），而不是靠事后清空。
-            if suppressed and not kept:
-                logger.info(
-                    "silent 模式：本轮全部产出均为任务旁白（%d 条），"
-                    "按安全策略保留不压制（避免吞消息）",
-                    len(suppressed),
-                )
-                return
-            if not suppressed:
-                return
-            actions[:] = kept  # 就地修改：框架随后按此列表逐条发送
-            logger.info(
-                "silent 模式：压制 %d 条定时任务旁白，保留 %d 条本轮其它消息"
-                "（保留的是任务途中回应群友的内容）",
-                len(suppressed), len(kept),
-            )
-        except Exception as e:
-            logger.warning(f"silent 模式守卫异常，本轮不压制任何消息（避免吞消息）: {e}")
 
     # ---------- 带黑名单检查的定时任务 ----------
     async def _auto_publish_job(self):
