@@ -1,4 +1,7 @@
-# QQ空间助手插件安装使用教程（小白版） v1.4.10
+# QQ空间助手插件安装使用教程（小白版） v1.4.11
+
+> **框架兼容性**：支持 KiraAI 2.29.6+ 与 3.0 全系列（含 v3.0.0-rc.1；兼容判断走特征识别，不绑版本号）。
+> v1.4.11：适配 3.0 rc.1 的会话能力接口异步化——会话识图模式改 30s 缓存 + 异步预热（`on_llm_request` 钩子保持零 await 的结构不变量），修复 3.0 下 native 图兜底资格静默失效。
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_qzone_plugin)
 

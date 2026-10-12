@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import html
 import json
 import logging
@@ -293,6 +294,8 @@ class QzonePlugin(BasePlugin):
 
         # 近期图片注册表：sid -> [{"elem": Image, "sender": str, "time": int, "desc": Optional[str]}]
         self._image_registry: dict[str, list[dict]] = {}
+        # 会话识图模式缓存：{sid: (monotonic_ts, mode)}，TTL 30s（见 _session_image_mode）
+        self._image_mode_cache: dict[str, tuple[float, str]] = {}
 
         # 空间图片 url -> md5 映射（避免重复下载）
         self._url_md5: dict[str, str] = {}
@@ -458,6 +461,7 @@ class QzonePlugin(BasePlugin):
         selected = self._dedupe_sources(selected)
         if target <= 0 or len(selected) >= target:
             return selected[:target] if target > 0 else selected
+        await self._warm_image_mode_cache(sid)
         entries = self._manifest_entries(sid, apply_dedupe=True)
         for index in range(1, len(entries) + 1):
             resolved = await self._resolve_manifest_images(sid, [index], apply_dedupe=True)
@@ -1675,6 +1679,7 @@ class QzonePlugin(BasePlugin):
         sid = getattr(event, "sid", "")
         if not sid:
             return
+        self._schedule_mode_warm(sid)
         registry = self._image_registry.setdefault(sid, [])
         for message in getattr(event, "messages", None) or []:
             sender = ""
@@ -1911,6 +1916,7 @@ class QzonePlugin(BasePlugin):
             sender = ""
             if event.message.sender:
                 sender = event.message.sender.nickname or str(event.message.sender.user_id or "")
+            await self._warm_image_mode_cache(sid)
             registry = self._image_registry.setdefault(sid, [])
             stamp = int(event.message.timestamp or time.time())
             msg_id = getattr(event.message, "message_id", None)
@@ -1939,16 +1945,59 @@ class QzonePlugin(BasePlugin):
         for sid in list(self._image_registry)[:overflow]:
             self._image_registry.pop(sid, None)
 
-    def _session_image_mode(self, sid: str) -> str:
-        """读该会话的识图模式（框架自己也是这么读的）。
-
-        用来给"框架没写 caption"的 native 图兜底资格：native 模式下图是原样发给
-        多模态模型的（她亲眼看过），即使框架以后不写占位串，也仍然应该能进清单。
-        """
+    def _schedule_mode_warm(self, sid: str) -> None:
+        """在有事件循环的同步上下文里排一个后台预热（不阻塞调用方）。"""
         try:
-            caps = self.ctx.get_session_capabilities(sid) or {}
-            rec = caps.get("image_recognition") or {}
-            return str(rec.get("mode") or "")
+            asyncio.get_running_loop().create_task(self._warm_image_mode_cache(sid))
+        except Exception:
+            pass
+
+    async def _warm_image_mode_cache(self, sid: str) -> None:
+        """异步路径到点时预热会话识图模式缓存（TTL 30s）。
+
+        3.0 rc.1 起 get_session_capabilities 已异步化，2.x 为同步返回。
+        isawaitable 探测两代通吃，不绑版本号。
+        """
+        ent = self._image_mode_cache.get(sid)
+        if ent and (time.monotonic() - ent[0]) < 30.0:
+            return
+        try:
+            res = self.ctx.get_session_capabilities(sid)
+            caps = (await res) if inspect.isawaitable(res) else res
+            rec = (caps or {}).get("image_recognition") or {}
+            self._image_mode_cache[sid] = (time.monotonic(), str(rec.get("mode") or ""))
+        except Exception:
+            pass
+
+    def _session_image_mode(self, sid: str) -> str:
+        """读该会话的识图模式（TTL 缓存；钩子内可安全同步调用）。
+
+        用来给"框架没写 caption"的 native 图兜底资格。结构不变量：
+        on_llm_request 钩子必须零 await（纯读不阻塞），而 3.0 rc.1 起该接口已
+        异步化，故同步读点只读缓存：2.x 同步直读并回填；3.0 冷缓存返回 ""
+        （与旧异常路径一致）并后台预热，下一轮即准。常规流程下消息到达
+        （_collect_images）先于本轮钩子，冷缓存极少见。
+        """
+        ent = self._image_mode_cache.get(sid)
+        if ent and (time.monotonic() - ent[0]) < 30.0:
+            return ent[1]
+        try:
+            res = self.ctx.get_session_capabilities(sid)
+        except Exception:
+            return ""
+        if inspect.isawaitable(res):
+            # 3.0：不能 await（钩子零 await 不变量），关闭 coroutine 防告警后后台预热
+            try:
+                res.close()
+            except Exception:
+                pass
+            self._schedule_mode_warm(sid)
+            return ""
+        try:
+            rec = (res or {}).get("image_recognition") or {}
+            mode = str(rec.get("mode") or "")
+            self._image_mode_cache[sid] = (time.monotonic(), mode)
+            return mode
         except Exception:
             return ""
 
@@ -2231,6 +2280,7 @@ class QzonePlugin(BasePlugin):
         避免连续几条说说配同一张图；用户主动指定图片时不受影响。
         """
         paths = []
+        await self._warm_image_mode_cache(sid)
         entries = self._manifest_entries(sid, apply_dedupe=apply_dedupe)
         normalized_indices = []
         for idx in indices:
@@ -2829,6 +2879,7 @@ class QzonePlugin(BasePlugin):
                     # 直接忽略它照常发布，不让"多传一个参数"白白推迟一轮。
                     logger.info("本轮已注入[近期图片]清单，忽略 want_images 参数，直接按原流程发布")
                 else:
+                    await self._warm_image_mode_cache(sid)
                     entries = self._manifest_entries(
                         sid, apply_dedupe=task_policy is not None
                     )
